@@ -40,20 +40,41 @@ function resolveBaseURL(): string {
   return `${mosesBasePath()}/api/v1`;
 }
 
+/** Read a non-HttpOnly cookie value by name; undefined when absent. */
+function readCookie(name: string): string | undefined {
+  const match = document.cookie.match(
+    new RegExp(`(?:^|; )${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=([^;]*)`),
+  );
+  return match ? decodeURIComponent(match[1]) : undefined;
+}
+
+const MUTATING_METHODS = new Set(['post', 'put', 'patch', 'delete']);
+
 /**
  * Apply the moses-chat-bot interceptors to any axios instance. Exported for
  * testing; production code uses the pre-configured `api` singleton below.
  */
 export function attachInterceptors(instance: AxiosInstance): AxiosInstance {
   instance.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+    // Some axios versions ship a plain object on `config.headers`; normalize.
+    const headers =
+      config.headers instanceof AxiosHeaders
+        ? config.headers
+        : new AxiosHeaders(config.headers as Record<string, string> | undefined);
+    config.headers = headers;
+
     if (isEmbedded()) {
-      // Some axios versions ship a plain object on `config.headers`; normalize.
-      if (config.headers instanceof AxiosHeaders) {
-        config.headers.set('X-Requested-With', 'moses-iframe');
-      } else {
-        const next = new AxiosHeaders(config.headers as Record<string, string> | undefined);
-        next.set('X-Requested-With', 'moses-iframe');
-        config.headers = next;
+      headers.set('X-Requested-With', 'moses-iframe');
+    }
+
+    // Moses protects cookie-authed mutating requests (e.g. the platform
+    // /api/v1/api-keys mint) with a double-submit CSRF token: the csrf_token
+    // cookie must be echoed in the X-CSRF-Token header. The cookie is set
+    // on the shared same-origin Moses session; read and forward it.
+    if (MUTATING_METHODS.has((config.method ?? 'get').toLowerCase())) {
+      const csrf = readCookie('csrf_token');
+      if (csrf) {
+        headers.set('X-CSRF-Token', csrf);
       }
     }
     return config;
