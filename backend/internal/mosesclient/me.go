@@ -25,17 +25,22 @@ type Me struct {
 	TenantMemberships []TenantMembership `json:"tenantMemberships"`
 }
 
-// GetMe calls GET /api/v1/auth/me with the supplied bearer token (which may
-// be a session JWT extracted from the user's access_token cookie). It is the
+// GetMe calls GET /auth/me with the supplied bearer token (which may be a
+// session JWT extracted from the user's access_token cookie). It is the
 // authoritative validation path: a 200 means the platform considers the
 // caller a logged-in user. tenantID may be uuid.Nil; when non-nil it is
 // forwarded as X-Tenant-ID so the platform resolves the user's tenant
 // context the same way the browser would.
 //
+// NOTE: the platform mounts auth routes at /auth/* — NOT under the /api/v1
+// prefix every other moses-backend endpoint uses. /api/v1/auth/me returns
+// 404, which surfaced to users as a 502 "auth lookup failed" on every
+// bot request.
+//
 // Used by the bot's RequireUser middleware to bridge the iframe cookie to
 // (moses_user_id, tenant_id) without local JWT signature trust.
 func (c *Client) GetMe(ctx context.Context, bearer string, tenantID uuid.UUID) (*Me, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, "/api/v1/auth/me", nil)
+	req, err := c.newRequest(ctx, http.MethodGet, "/auth/me", nil)
 	if err != nil {
 		return nil, err
 	}

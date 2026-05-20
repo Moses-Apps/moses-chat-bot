@@ -1,7 +1,7 @@
 // Package middleware holds stdlib-http middleware shared by the bot's
 // HTTP handlers. v1 ships only RequireUser, which bridges the iframe
 // session cookie to (moses_user_id, tenant_id) by forwarding to the
-// platform's /api/v1/auth/me endpoint.
+// platform's /auth/me endpoint.
 //
 // Forward-to-platform is the safer of the two paths considered (the
 // other being local JWT decode without signature verification). The bot
