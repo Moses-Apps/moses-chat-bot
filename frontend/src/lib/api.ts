@@ -18,6 +18,7 @@ import axios, {
   type InternalAxiosRequestConfig,
 } from 'axios';
 import { isEmbedded } from './iframe';
+import { mosesBasePath } from './basePath';
 
 export interface ApiError {
   status: number;
@@ -27,13 +28,16 @@ export interface ApiError {
   cause?: unknown;
 }
 
-const DEFAULT_BASE_URL = '/api/v1';
-
 function resolveBaseURL(): string {
   // import.meta.env is statically replaced by Vite at build time; the optional
   // chain guards tests that mock a bare environment.
   const env = (import.meta as { env?: Record<string, string | undefined> }).env;
-  return env?.VITE_API_BASE ?? DEFAULT_BASE_URL;
+  if (env?.VITE_API_BASE) return env.VITE_API_BASE;
+  // The bot's OWN backend is reachable only under the app's runtime deploy
+  // prefix — Moses routes /apps/<tenant>/<app>/* to this app's nginx. A bare
+  // '/api/v1' resolves against the iframe origin root and hits the Moses
+  // gateway instead (404). Prefix with the runtime base path.
+  return `${mosesBasePath()}/api/v1`;
 }
 
 /**

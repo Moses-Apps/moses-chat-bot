@@ -11,22 +11,12 @@ import LinkDetail from '@/pages/LinkDetail';
 import Messages from '@/pages/Messages';
 import Settings from '@/pages/Settings';
 import NotFound from '@/pages/NotFound';
+import { mosesBasePath } from '@/lib/basePath';
 
-// The React Router basename must be the RUNTIME deploy prefix, not the
-// build-time vite base. Vite is built with base './' so assets stay
-// prefix-relative, which makes import.meta.env.BASE_URL './' — not a valid
-// router basename. The nginx entrypoint injects the real MOSES_BASE_PATH
-// into <meta name="moses-base-path">; read that. Falls back to '/' for
-// standalone / jsdom where the tag is absent.
+// The React Router basename is the RUNTIME deploy prefix (see lib/basePath),
+// never the build-time vite base. '' (standalone / jsdom) maps to '/'.
 function resolveBaseName(): string {
-  const content = document
-    .querySelector('meta[name="moses-base-path"]')
-    ?.getAttribute('content')
-    ?.trim();
-  if (content && content.startsWith('/')) {
-    return content.replace(/\/+$/, '') || '/';
-  }
-  return '/';
+  return mosesBasePath() || '/';
 }
 
 export default function App(): ReactElement {
