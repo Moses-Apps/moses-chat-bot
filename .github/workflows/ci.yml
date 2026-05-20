@@ -25,7 +25,7 @@ jobs:
       actions: read
     strategy:
       matrix:
-        go-version: ['1.24']
+        go-version: ['1.25']
     # Postgres service container — testcontainer-backed tests in this repo
     # talk to a real Postgres. TEST_DATABASE_URL lets the test bootstrap skip
     # spinning a container and reuse the service instead, which is much
