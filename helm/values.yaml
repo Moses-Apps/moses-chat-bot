@@ -20,7 +20,12 @@ fullnameOverride: ""
 
 replicaCount: 1
 
-image:
+# Image references (v2 format). Keyed by docker.files[].name from
+# moses-app.config.json. Moses OVERRIDES these at deploy time via
+# --set images.{name}.repository=... / images.{name}.tag=... — the value
+# path MUST be `images.<name>` (plural) to match the orchestrator, exactly
+# like the moses-default-app-templates.
+images:
   frontend:
     repository: "moses-chat-bot-frontend"
     tag: "latest"
