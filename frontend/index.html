@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="moses-base-path" content="__MOSES_BASE_PATH__" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="moses-chat-bot — Moses Manager bridge to mobile chat" />
+    <title>Moses Chat Bot</title>
+    <!--
+      Moses iframe SDK. Provides window.moses.actions.invoke(actionId, vars).
+      The SDK POSTs to /__moses/invoke on this app's own backend; the proxy
+      forwards pod-to-pod to moses-backend with the user's JWT preserved.
+    -->
+    <script src="/api/v1/sdk/iframe-sdk.js" defer></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,60 @@
+{
+  "name": "moses-chat-bot",
+  "version": "0.1.0",
+  "displayName": "Chat Bot Bridge",
+  "description": "Bridge Moses Manager to mobile chat (Telegram, Discord, Slack)...",
+  "appType": "hybrid",
+  "entrypoint": "index.html",
+  "templateApiVersion": "moses.ai/v1",
+  "embedding": { "framing": "moses-only" },
+  "displayLocations": ["apps"],
+  "permissions": [],
+  "skills": ["skills/bot-architecture.md"],
+  "apiEndpoints": {
+    "basePath": "/api/v1",
+    "healthPath": "/health",
+    "specPath": "/api/openapi.json"
+  },
+  "autoRegisterTool": true,
+  "appData": { "enabled": false },
+  "helm": { "chartPath": "helm" },
+  "docker": {
+    "files": [
+      { "name": "frontend", "dockerfile": "frontend/Dockerfile", "context": "frontend" },
+      { "name": "backend",  "dockerfile": "backend/Dockerfile",  "context": "backend"  }
+    ]
+  },
+  "services": {
+    "frontend": {
+      "port": 8080,
+      "healthCheck": { "enabled": true, "path": "/health" },
+      "ingress": { "enabled": true },
+      "resources": { "cpu": { "request": "50m", "limit": "200m" }, "memory": { "request": "64Mi", "limit": "256Mi" } }
+    },
+    "backend": {
+      "port": 8080,
+      "healthCheck": { "enabled": true, "path": "/health" },
+      "resources": { "cpu": { "request": "100m", "limit": "500m" }, "memory": { "request": "128Mi", "limit": "512Mi" } }
+    }
+  },
+  "dependencies": { "services": ["postgresql"] },
+  "integrations": {
+    "required": [
+      {
+        "type": "moses-platform",
+        "key": "default",
+        "scopes": ["chat_relay", "workspace_push"],
+        "envMapping": { "apiKey": "MOSES_PLATFORM_API_KEY", "apiUrl": "MOSES_PLATFORM_API_URL" }
+      }
+    ]
+  },
+  "validation": {
+    "enabled": true,
+    "commands": [
+      { "name": "backend-vet",  "run": "cd backend && go vet ./...",  "required": true },
+      { "name": "backend-test", "run": "cd backend && go test ./...", "required": true },
+      { "name": "frontend-lint","run": "cd frontend && npm install --include=dev --ignore-scripts && npm run lint", "required": true },
+      { "name": "frontend-test","run": "cd frontend && npm test -- --run", "required": true }
+    ]
+  }
+}

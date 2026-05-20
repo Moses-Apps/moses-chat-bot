@@ -1,0 +1,305 @@
+# CI for moses-chat-bot.
+# Runs on every PR + push to main. Jobs run in parallel; none of them need
+# write permissions (no pushes, no releases) — read-all + per-job scopes.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: read-all
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      matrix:
+        go-version: ['1.24']
+    # Postgres service container — testcontainer-backed tests in this repo
+    # talk to a real Postgres. TEST_DATABASE_URL lets the test bootstrap skip
+    # spinning a container and reuse the service instead, which is much
+    # faster in CI.
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:ci@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Download modules
+        working-directory: backend
+        run: go mod download
+
+      - name: go vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: staticcheck
+        working-directory: backend
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+
+      - name: go test (race + cover)
+        working-directory: backend
+        run: go test -race -cover ./...
+
+      - name: go build
+        working-directory: backend
+        run: go build ./...
+
+  frontend:
+    name: Frontend (Node 20)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Test
+        working-directory: frontend
+        run: npm test -- --run
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  e2e:
+    name: Frontend E2E (Playwright / chromium)
+    runs-on: ubuntu-latest
+    needs: frontend
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install npm deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright (chromium + system deps)
+        working-directory: frontend
+        run: npm run e2e:install
+
+      - name: Build frontend (preview server serves the static bundle)
+        working-directory: frontend
+        run: npm run build
+
+      - name: Run Playwright tests
+        working-directory: frontend
+        env:
+          CI: 'true'
+        run: npm run e2e:ci
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-e2e-results
+          path: |
+            frontend/e2e-results
+            frontend/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+
+  helm:
+    name: Helm lint + template
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.0
+
+      - name: helm lint
+        run: helm lint helm/
+
+      - name: helm template render
+        run: |
+          helm template helm/ \
+            --values helm/values.yaml \
+            --set image.backend.tag=ci \
+            --set image.frontend.tag=ci \
+            > /tmp/render.yaml
+          # Sanity check the render is non-empty.
+          test -s /tmp/render.yaml
+      # NOTE: kubeval/kubeconform validation skipped intentionally — the helm
+      # chart pulls in a Bitnami postgres subchart whose schema lookups break
+      # several validators in offline CI runs. Re-introduce if/when we ship
+      # the schema bundles.
+
+  docker:
+    name: Docker build (no push)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/Dockerfile
+          push: false
+          tags: moses-chat-bot-backend:ci
+          load: false
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          file: frontend/Dockerfile
+          push: false
+          tags: moses-chat-bot-frontend:ci
+          load: false
+
+  security:
+    name: Security scans
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs full history to scan past commits effectively
+          fetch-depth: 0
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  openapi:
+    name: OpenAPI lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # T-PUSH-1 lands the real openapi.json. Until then it may be missing
+      # or a stub. Skip with a warning rather than failing CI on unrelated
+      # branches.
+      - name: Locate spec
+        id: locate
+        run: |
+          path=$(git ls-files '*openapi.json*' | head -n1 || true)
+          if [ -z "$path" ]; then
+            echo "::warning::openapi.json not found yet (T-PUSH-1 pending) — skipping lint"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -q "not yet implemented" "$path"; then
+            echo "::warning::openapi.json is still a stub — skipping lint"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Redocly lint
+        if: steps.locate.outputs.path != ''
+        env:
+          SPEC_PATH: ${{ steps.locate.outputs.path }}
+        run: npx --yes @redocly/cli@latest lint "$SPEC_PATH"
+
+  spec-sync:
+    name: SPEC operation IDs (informational)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Non-blocking: drift here surfaces as a warning so future contributors
+    # notice but do not see a red check during template-only work.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check operation IDs mentioned in SPEC.md
+        run: |
+          missing=()
+          for op in pushMessage listLinks notifyLink listRecentMessages; do
+            if ! grep -q "$op" SPEC.md; then
+              missing+=("$op")
+            fi
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::warning::SPEC.md is missing operation IDs: ${missing[*]}"
+            exit 1
+          fi
+          echo "All four operation IDs referenced in SPEC.md."

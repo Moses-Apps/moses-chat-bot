@@ -1,0 +1,25 @@
+moses-chat-bot v{{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}".
+
+Access:
+{{- if .Values.ingress.enabled }}
+  http{{ if .Values.ingress.tls }}s{{ end }}://{{ .Values.ingress.host }}{{ .Values.ingress.path }}
+{{- else }}
+  Ingress disabled — port-forward to test:
+    kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "moses-chat-bot.fullname" . }}-frontend {{ .Values.service.frontend.port }}:{{ .Values.service.frontend.port }}
+{{- end }}
+
+Next steps:
+  1. Provision a Telegram bot via @BotFather and obtain the bot token.
+  2. Create a K8s Secret carrying TELEGRAM_BOT_TOKEN (and TELEGRAM_WEBHOOK_SECRET),
+     then add its name to `secrets.secretNames`:
+        kubectl create secret generic moses-chat-bot-telegram \
+          --from-literal=TELEGRAM_BOT_TOKEN=... \
+          --from-literal=TELEGRAM_WEBHOOK_SECRET=$(openssl rand -hex 32)
+  3. helm upgrade {{ .Release.Name }} . \
+        --set 'secrets.secretNames[0]=moses-chat-bot-telegram'
+
+The chat-bot master encryption key Secret
+({{ include "moses-chat-bot.masterKeySecretName" . }}) is auto-generated on
+first install and PRESERVED across upgrades + uninstall via
+`helm.sh/resource-policy: keep`. Deleting it invalidates every linked
+Telegram user and forces re-linking — handle with care.

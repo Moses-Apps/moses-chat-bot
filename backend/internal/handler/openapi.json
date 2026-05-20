@@ -1,0 +1,341 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "moses-chat-bot",
+    "version": "0.1.0",
+    "description": "Workspace-tool surface for Moses Manager to push messages to a user's linked chat providers (Telegram first). Endpoints under /api/v1/push and /api/v1/workspace are intended for the platform workspace-tool proxy; the proxy authenticates with MOSES_PLATFORM_API_KEY and injects X-Moses-Tenant-ID, which these handlers trust. The /api/v1/links group (not described here) is the user-cookie-scoped surface mounted by T-LINK-1."
+  },
+  "servers": [
+    { "url": "/", "description": "Bot service root (paths are absolute)." }
+  ],
+  "paths": {
+    "/api/v1/push/message": {
+      "post": {
+        "operationId": "pushMessage",
+        "summary": "Send a message to every active link of a Moses user.",
+        "description": "Fans out an outbound message to all active links of the given moses_user_id in the calling tenant, optionally filtered by provider or chat_id. Returns 200 with sent_count=0 (NOT 404) when the user has no active links. Per-link errors are surfaced inside results[]; only true infrastructure failures (DB outage) return 500.",
+        "parameters": [
+          { "$ref": "#/components/parameters/MosesTenantID" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PushMessageRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Fan-out complete; results[] holds per-link outcomes.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PushMessageResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/v1/workspace/links": {
+      "get": {
+        "operationId": "listLinks",
+        "summary": "List active chat links visible to the calling tenant.",
+        "description": "Returns every active link in the tenant. When moses_user_id is supplied, the result is restricted to that user. Used by MM for 'which of my users has Telegram linked?'.",
+        "parameters": [
+          { "$ref": "#/components/parameters/MosesTenantID" },
+          {
+            "name": "moses_user_id",
+            "in": "query",
+            "required": false,
+            "description": "Optional filter — restrict to one Moses user's links.",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Link list (possibly empty).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LinksResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/v1/workspace/links/{id}/notify": {
+      "post": {
+        "operationId": "notifyLink",
+        "summary": "Send a message to a single link by ID.",
+        "description": "Cheaper than pushMessage when MM has already resolved the target link. Tenant scoping is enforced — a link belonging to a different tenant returns 404, never 'exists but forbidden'.",
+        "parameters": [
+          { "$ref": "#/components/parameters/MosesTenantID" },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "chat_relay_links.id",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/NotifyRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Send attempt complete (sent=true on success; sent=false with error on per-provider failure).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/NotifyResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "429": {
+            "description": "Per-link rate limit exceeded. Retry-After header carries seconds-until-retry.",
+            "headers": {
+              "Retry-After": {
+                "description": "Suggested seconds to wait before retrying.",
+                "schema": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/NotifyResponse" }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/v1/workspace/messages": {
+      "get": {
+        "operationId": "listRecentMessages",
+        "summary": "List recent relay messages for a user (audit / context).",
+        "description": "Returns the most recent inbound + outbound relay rows for the given Moses user, capped at 100. Used by MM to assemble context before responding (e.g. 'show me what we talked about today').",
+        "parameters": [
+          { "$ref": "#/components/parameters/MosesTenantID" },
+          {
+            "name": "moses_user_id",
+            "in": "query",
+            "required": true,
+            "description": "Required — the Moses user whose history to fetch.",
+            "schema": { "type": "string", "format": "uuid" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Page size. Default 50, max 100.",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Message list, newest-first.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MessagesResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "MosesTenantID": {
+        "name": "X-Moses-Tenant-ID",
+        "in": "header",
+        "required": true,
+        "description": "Tenant scope, injected by the platform workspace-tool proxy. MUST be a UUID; otherwise 401.",
+        "schema": { "type": "string", "format": "uuid" }
+      }
+    },
+    "schemas": {
+      "ProviderFilter": {
+        "type": "object",
+        "description": "Optional fan-out narrowing. Empty arrays / omitted fields mean 'no constraint on this dimension'.",
+        "properties": {
+          "providers": {
+            "type": "array",
+            "items": { "type": "string", "example": "telegram" },
+            "description": "Restrict to links whose provider is in this list."
+          },
+          "chat_ids": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Restrict to links whose primary chat id is in this list."
+          }
+        }
+      },
+      "PushMessageRequest": {
+        "type": "object",
+        "required": ["moses_user_id", "text"],
+        "properties": {
+          "moses_user_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Target Moses user. Must belong to the calling tenant."
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8000,
+            "description": "Message body. Trimmed; empty after trim is a 400."
+          },
+          "markdown": {
+            "type": "boolean",
+            "default": false,
+            "description": "Hint to the provider adapter to render markdown. Adapters that cannot render it degrade to plain text."
+          },
+          "provider_filter": { "$ref": "#/components/schemas/ProviderFilter" }
+        }
+      },
+      "LinkResult": {
+        "type": "object",
+        "required": ["link_id", "provider", "chat_id", "sent", "message_row_id"],
+        "properties": {
+          "link_id":        { "type": "string", "format": "uuid" },
+          "provider":       { "type": "string", "example": "telegram" },
+          "chat_id":        { "type": "string" },
+          "sent":           { "type": "boolean", "description": "true iff the provider's SendMessage returned nil." },
+          "error":          { "type": "string", "description": "Populated when sent=false." },
+          "message_row_id": { "type": "string", "format": "uuid", "description": "chat_relay_messages.id of the persisted audit row (success or failure). Zero UUID if persistence itself failed." }
+        }
+      },
+      "PushMessageResponse": {
+        "type": "object",
+        "required": ["sent_count", "results"],
+        "properties": {
+          "sent_count": { "type": "integer", "minimum": 0, "description": "Count of results where sent=true." },
+          "results": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/LinkResult" }
+          }
+        }
+      },
+      "LinkSummary": {
+        "type": "object",
+        "required": ["id", "moses_user_id", "provider", "provider_user_id", "created_at"],
+        "properties": {
+          "id":               { "type": "string", "format": "uuid" },
+          "moses_user_id":    { "type": "string", "format": "uuid" },
+          "provider":         { "type": "string", "example": "telegram" },
+          "provider_user_id": { "type": "string" },
+          "last_used_at":     { "type": "string", "format": "date-time", "nullable": true },
+          "created_at":       { "type": "string", "format": "date-time" }
+        }
+      },
+      "LinksResponse": {
+        "type": "object",
+        "required": ["links"],
+        "properties": {
+          "links": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/LinkSummary" }
+          }
+        }
+      },
+      "NotifyRequest": {
+        "type": "object",
+        "required": ["text"],
+        "properties": {
+          "text":     { "type": "string", "minLength": 1, "maxLength": 8000 },
+          "markdown": { "type": "boolean", "default": false }
+        }
+      },
+      "NotifyResponse": {
+        "type": "object",
+        "required": ["sent", "message_row_id"],
+        "properties": {
+          "sent":           { "type": "boolean" },
+          "error":          { "type": "string" },
+          "message_row_id": { "type": "string", "format": "uuid" }
+        }
+      },
+      "MessageSummary": {
+        "type": "object",
+        "required": ["id", "link_id", "direction", "text", "occurred_at"],
+        "properties": {
+          "id":          { "type": "string", "format": "uuid" },
+          "link_id":     { "type": "string", "format": "uuid" },
+          "direction":   { "type": "string", "enum": ["in", "out"] },
+          "text":        { "type": "string" },
+          "occurred_at": { "type": "string", "format": "date-time" },
+          "error":       { "type": "string", "description": "Non-empty iff the row records a delivery failure." }
+        }
+      },
+      "MessagesResponse": {
+        "type": "object",
+        "required": ["messages"],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/MessageSummary" }
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error", "code"],
+        "properties": {
+          "error": { "type": "string", "description": "Human-readable diagnostic." },
+          "code":  { "type": "string", "description": "Machine-readable token (e.g. 'bad_request', 'not_found', 'rate_limited')." }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed request — JSON parse failure, missing field, or value out of range.",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing or unparseable X-Moses-Tenant-ID.",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } }
+        }
+      },
+      "Forbidden": {
+        "description": "Tenant mismatch — the resource exists under a different tenant.",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found, or resource exists under a different tenant (collapsed to 404 to avoid cross-tenant leakage).",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } }
+        }
+      },
+      "InternalError": {
+        "description": "Server-side failure — DB outage, provider unreachable, etc.",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } }
+        }
+      }
+    }
+  }
+}

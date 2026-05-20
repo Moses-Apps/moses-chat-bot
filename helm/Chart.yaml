@@ -1,0 +1,9 @@
+apiVersion: v2
+name: moses-chat-bot
+description: Bridge Moses Manager to mobile chat (Telegram, Discord, Slack) — relays an authenticated Moses-Manager session to consumer chat providers.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+annotations:
+  moses.ai/template-version: "3"
+  moses.ai/scaffold-type: "multi"

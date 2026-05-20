@@ -1,0 +1,122 @@
+# moses-chat-bot Helm values.
+# Defaults match a single-tenant standalone install; the Moses platform
+# overrides moses.*, image.*.tag, ingress.host, and secrets.secretNames
+# at deploy time.
+
+moses:
+  namespace: ""
+  tenantId: ""
+  executionId: ""
+  chartId: ""
+  appSlug: "moses-chat-bot"
+  basePath: "/"
+  embedding:
+    framing: "moses-only"
+    allowedAncestors: []
+    reportUri: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+image:
+  frontend:
+    repository: "moses-chat-bot-frontend"
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  backend:
+    repository: "moses-chat-bot-backend"
+    tag: "latest"
+    pullPolicy: IfNotPresent
+
+service:
+  frontend:
+    port: 8080
+  backend:
+    port: 8080
+
+# Multi-secret envFrom pattern per Moses platform contract (CHAT-pswm.4).
+# The platform appends auto-generated secret names (telegram tokens,
+# platform API key, etc.) at deploy time. Each name must reference an
+# existing K8s Secret in the same namespace.
+secrets:
+  secretNames: []
+
+# Resources (matches moses-app.config.json §13)
+resources:
+  frontend:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+  backend:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+# Per-deployment open envMap. Keys here are appended as plain env entries
+# on the matching container. Values from `secrets.secretNames` win at
+# runtime because envFrom is evaluated after env (K8s semantics).
+env:
+  frontend: {}
+  backend: {}
+
+postgres:
+  enabled: true
+  image:
+    repository: postgres
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+  auth:
+    username: "chatbot"
+    database: "chatbot"
+    # __MOSES_GENERATE_PASSWORD__ is a sentinel the Moses provisioner
+    # rewrites to a per-tenant random 24-char password. For standalone
+    # `helm install` set --set postgres.auth.password=...
+    password: "__MOSES_GENERATE_PASSWORD__"
+    # If set, postgres password is sourced from this pre-existing Secret
+    # under key `postgresql-password` instead of auth.password above.
+    existingSecret: ""
+  storage:
+    size: 1Gi
+    # Empty -> use cluster's default StorageClass. Set to a string to pin.
+    storageClassName: ""
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+
+# Auto-generated chat-bot master encryption key (see SPEC §6).
+# A 32-byte random secret is rendered once at install time using
+# Helm's `lookup` so upgrades stay idempotent. Rotating this would
+# invalidate every encrypted per-user API key — DO NOT rotate without
+# a planned re-link campaign.
+masterKey:
+  # Override to use a pre-existing Secret (key = `master-key.json`).
+  existingSecret: ""
+
+ingress:
+  enabled: true
+  className: ""
+  host: "chart-example.local"
+  path: "/"
+  pathType: Prefix
+  tls: []
+  annotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext: {}
+securityContext: {}

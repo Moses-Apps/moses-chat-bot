@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "moses-chat-bot.fullname" . }}-frontend
+  labels:
+    {{- include "moses-chat-bot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "moses-chat-bot.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: frontend
+  template:
+    metadata:
+      labels:
+        {{- include "moses-chat-bot.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: frontend
+        moses.ai/tenant-id: {{ .Values.moses.tenantId | quote }}
+        {{- if .Values.moses.chartId }}
+        moses.ai/chart-id: {{ .Values.moses.chartId | quote }}
+        {{- end }}
+        {{- if .Values.moses.appSlug }}
+        moses.ai/app-slug: {{ .Values.moses.appSlug | quote }}
+        {{- end }}
+        moses.ai/managed-by: moses
+    spec:
+      serviceAccountName: {{ include "moses-chat-bot.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: frontend
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: "{{ .Values.image.frontend.repository }}:{{ .Values.image.frontend.tag }}"
+          imagePullPolicy: {{ .Values.image.frontend.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.frontend.port }}
+              protocol: TCP
+          {{- if .Values.secrets.secretNames }}
+          envFrom:
+            {{- include "moses-chat-bot.envFromSecrets" . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: MOSES_BASE_PATH
+              value: {{ .Values.moses.basePath | quote }}
+            - name: BASE_URL
+              value: {{ .Values.moses.basePath | quote }}
+            - name: MOSES_APP_SLUG
+              value: {{ .Values.moses.appSlug | quote }}
+            - name: MOSES_TENANT_ID
+              value: {{ .Values.moses.tenantId | quote }}
+            - name: MOSES_CHART_ID
+              value: {{ .Values.moses.chartId | quote }}
+            - name: MOSES_EMBEDDING_FRAMING
+              value: {{ .Values.moses.embedding.framing | quote }}
+            - name: MOSES_EMBEDDING_ALLOWED_ANCESTORS
+              value: {{ join " " .Values.moses.embedding.allowedAncestors | quote }}
+            - name: MOSES_EMBEDDING_REPORT_URI
+              value: {{ .Values.moses.embedding.reportUri | quote }}
+            - name: BACKEND_SERVICE_HOST
+              value: "{{ include "moses-chat-bot.fullname" . }}-backend"
+            - name: BACKEND_SERVICE_PORT
+              value: {{ .Values.service.backend.port | quote }}
+            {{- range $key, $value := .Values.env.frontend }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.resources.frontend | nindent 12 }}

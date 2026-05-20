@@ -1,0 +1,5 @@
+# Use bd merge for beads JSONL files
+.beads/issues.jsonl merge=beads
+
+# Machine-managed configuration files — moses-agents is authoritative.
+moses-app.config.json merge=ours
