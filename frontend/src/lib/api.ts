@@ -40,15 +40,37 @@ function resolveBaseURL(): string {
   return `${mosesBasePath()}/api/v1`;
 }
 
-/** Read a non-HttpOnly cookie value by name; undefined when absent. */
-function readCookie(name: string): string | undefined {
-  const match = document.cookie.match(
-    new RegExp(`(?:^|; )${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=([^;]*)`),
-  );
-  return match ? decodeURIComponent(match[1]) : undefined;
+const MUTATING_METHODS = new Set(['post', 'put', 'patch', 'delete']);
+
+// Moses guards cookie-authed mutating requests with a double-submit CSRF
+// token. The csrf_token cookie is HttpOnly + SameSite=Strict, so JS cannot
+// read it — Moses instead echoes the current token in the `X-Csrf-Token`
+// RESPONSE header (including on the 403 it returns when the header is
+// missing). We cache that value and send it back as `X-CSRF-Token`.
+let csrfToken: string | null = null;
+
+function captureCsrf(headers: unknown): void {
+  const h = headers as { 'x-csrf-token'?: string } | undefined;
+  const token = h?.['x-csrf-token'];
+  if (typeof token === 'string' && token.length > 0) {
+    csrfToken = token;
+  }
 }
 
-const MUTATING_METHODS = new Set(['post', 'put', 'patch', 'delete']);
+function toApiError(error: AxiosError): ApiError {
+  const status = error.response?.status ?? 0;
+  const data = error.response?.data as
+    | { code?: string; error?: string; message?: string }
+    | undefined;
+  return {
+    status,
+    code: data?.code ?? (status ? `http_${status}` : 'network_error'),
+    message: data?.message ?? data?.error ?? error.message ?? 'Request failed',
+    cause: error,
+  };
+}
+
+type RetriableConfig = InternalAxiosRequestConfig & { __csrfRetried?: boolean };
 
 /**
  * Apply the moses-chat-bot interceptors to any axios instance. Exported for
@@ -66,34 +88,33 @@ export function attachInterceptors(instance: AxiosInstance): AxiosInstance {
     if (isEmbedded()) {
       headers.set('X-Requested-With', 'moses-iframe');
     }
-
-    // Moses protects cookie-authed mutating requests (e.g. the platform
-    // /api/v1/api-keys mint) with a double-submit CSRF token: the csrf_token
-    // cookie must be echoed in the X-CSRF-Token header. The cookie is set
-    // on the shared same-origin Moses session; read and forward it.
-    if (MUTATING_METHODS.has((config.method ?? 'get').toLowerCase())) {
-      const csrf = readCookie('csrf_token');
-      if (csrf) {
-        headers.set('X-CSRF-Token', csrf);
-      }
+    if (csrfToken && MUTATING_METHODS.has((config.method ?? 'get').toLowerCase())) {
+      headers.set('X-CSRF-Token', csrfToken);
     }
     return config;
   });
 
   instance.interceptors.response.use(
-    (response: AxiosResponse) => response,
+    (response: AxiosResponse) => {
+      captureCsrf(response.headers);
+      return response;
+    },
     (error: AxiosError) => {
-      const status = error.response?.status ?? 0;
-      const data = error.response?.data as
-        | { code?: string; error?: string; message?: string }
-        | undefined;
-      const apiError: ApiError = {
-        status,
-        code: data?.code ?? (status ? `http_${status}` : 'network_error'),
-        message: data?.message ?? data?.error ?? error.message ?? 'Request failed',
-        cause: error,
-      };
-      return Promise.reject(apiError);
+      const response = error.response;
+      if (response) {
+        captureCsrf(response.headers);
+        // Self-bootstrap: the first cookie-authed mutating call has no token
+        // and 403s; that 403 carries X-Csrf-Token. Retry it exactly once.
+        const cfg = error.config as RetriableConfig | undefined;
+        const body = response.data as { error?: string; code?: string } | undefined;
+        const isCsrf403 =
+          response.status === 403 && /csrf/i.test(`${body?.error ?? ''}${body?.code ?? ''}`);
+        if (isCsrf403 && csrfToken && cfg && !cfg.__csrfRetried) {
+          cfg.__csrfRetried = true;
+          return instance.request(cfg);
+        }
+      }
+      return Promise.reject(toApiError(error));
     },
   );
 

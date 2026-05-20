@@ -55,11 +55,12 @@ spec:
             - name: MOSES_CHART_ID
               value: {{ .Values.moses.chartId | quote }}
             - name: MOSES_INTERNAL_API_BASE
-              # Provisioner overrides this to the in-cluster moses-backend
-              # service URL. The default is intentionally empty so a
-              # mis-configured deploy fails loudly rather than calling
-              # the wrong target.
-              value: {{ default "" (index .Values.env.backend "MOSES_INTERNAL_API_BASE") | quote }}
+              # The platform provisioner injects this under globalEnv.* for
+              # multi-image deploys (agent_helm_provisioner — see
+              # agent_helm_provisioner_test.go: "must emit under globalEnv.*").
+              # Reading it from env.backend left it empty → the backend could
+              # not reach moses-backend and every auth lookup 502'd.
+              value: {{ default "" (index (.Values.globalEnv | default dict) "MOSES_INTERNAL_API_BASE") | quote }}
             {{- if .Values.postgres.enabled }}
             - name: DATABASE_HOST
               value: {{ include "moses-chat-bot.postgresFullname" . | quote }}
