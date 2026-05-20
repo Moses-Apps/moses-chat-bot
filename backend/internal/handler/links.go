@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +48,13 @@ func (h *Links) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/links/codes/{code}", h.handlePollCode)
 	mux.HandleFunc("GET /api/v1/links", h.handleListLinks)
 	mux.HandleFunc("DELETE /api/v1/links/{id}", h.handleDeleteLink)
+}
+
+// RegisterMessages mounts the global cross-link message endpoint. It lives on
+// its own mux because /api/v1/messages is outside the /api/v1/links prefix the
+// Register routes share. Caller wraps it with RequireUser.
+func (h *Links) RegisterMessages(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/v1/messages", h.handleSearchMessages)
 }
 
 // ============================================================================
@@ -216,6 +224,130 @@ func (h *Links) handleDeleteLink(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================================
+// GET /api/v1/messages   (optionally scoped with ?link_id=)
+// ============================================================================
+
+const (
+	defaultMessageLimit = 100
+	maxMessageLimit     = 200
+)
+
+// messageDTO is the user-facing message shape. Field names mirror the
+// frontend Message interface in bot-api.ts (camelCase) — this endpoint's
+// contract is owned by the in-app Messages page, not the workspace-tool
+// surface in push.go (which has its own snake_case shape).
+type messageDTO struct {
+	ID         uuid.UUID       `json:"id"`
+	LinkID     uuid.UUID       `json:"linkId"`
+	Direction  string          `json:"direction"`
+	Text       string          `json:"text"`
+	OccurredAt time.Time       `json:"occurredAt"`
+	Error      *string         `json:"error,omitempty"`
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
+}
+
+type messagesEnvelope struct {
+	Messages []messageDTO `json:"messages"`
+}
+
+func toMessageDTOs(msgs []db.ChatRelayMessage) []messageDTO {
+	out := make([]messageDTO, 0, len(msgs))
+	for _, m := range msgs {
+		dto := messageDTO{
+			ID:         m.ID,
+			LinkID:     m.LinkID,
+			Direction:  m.Direction,
+			Text:       m.Text,
+			OccurredAt: m.OccurredAt,
+			Error:      m.Error,
+		}
+		if len(m.Metadata) > 0 {
+			dto.Metadata = json.RawMessage(m.Metadata)
+		}
+		out = append(out, dto)
+	}
+	return out
+}
+
+// parseLimit reads ?limit, clamps to [1, maxMessageLimit], and falls back to
+// defaultMessageLimit on absence or a malformed value.
+func parseLimit(r *http.Request) int {
+	raw := r.URL.Query().Get("limit")
+	if raw == "" {
+		return defaultMessageLimit
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultMessageLimit
+	}
+	if n > maxMessageLimit {
+		return maxMessageLimit
+	}
+	return n
+}
+
+// ownedLink resolves a link the caller is allowed to read. The link must
+// belong to the caller's tenant AND to the caller themselves — a tenant
+// member must not read another member's relayed messages. A missing link
+// and a foreign-owned link both surface as 404 so existence is not leaked.
+// Returns false when a response has already been written.
+func (h *Links) ownedLink(w http.ResponseWriter, r *http.Request, tenantID, userID, linkID uuid.UUID) (*db.ChatRelayLink, bool) {
+	link, err := h.store.GetLinkByID(r.Context(), tenantID, linkID)
+	if err != nil {
+		if db.IsNoRows(err) {
+			writeError(w, http.StatusNotFound, "link not found")
+			return nil, false
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load link")
+		return nil, false
+	}
+	if link.MosesUserID != userID {
+		writeError(w, http.StatusNotFound, "link not found")
+		return nil, false
+	}
+	return link, true
+}
+
+// handleSearchMessages serves GET /api/v1/messages — messages across every
+// link the caller owns, or scoped to one link via ?link_id (the per-link
+// history view uses that form). Filtering by direction / free-text is
+// applied client-side today (see bot-api.ts).
+func (h *Links) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
+	userID := middleware.UserID(r.Context())
+	tenantID := middleware.TenantID(r.Context())
+	if userID == uuid.Nil || tenantID == uuid.Nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	limit := parseLimit(r)
+
+	if raw := r.URL.Query().Get("link_id"); raw != "" {
+		linkID, err := uuid.Parse(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "link_id must be a UUID")
+			return
+		}
+		if _, ok := h.ownedLink(w, r, tenantID, userID, linkID); !ok {
+			return
+		}
+		msgs, err := h.store.ListRecentByLink(r.Context(), linkID, limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list messages")
+			return
+		}
+		writeJSON(w, http.StatusOK, messagesEnvelope{Messages: toMessageDTOs(msgs)})
+		return
+	}
+
+	msgs, err := h.store.ListRecentByMosesUser(r.Context(), tenantID, userID, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list messages")
+		return
+	}
+	writeJSON(w, http.StatusOK, messagesEnvelope{Messages: toMessageDTOs(msgs)})
+}
+
+// ============================================================================
 // helpers
 // ============================================================================
 
@@ -234,10 +366,10 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // ============================================================================
 
 type rateLimiter struct {
-	mu        sync.Mutex
-	buckets   map[uuid.UUID]*rlBucket
-	limit     int
-	window    time.Duration
+	mu      sync.Mutex
+	buckets map[uuid.UUID]*rlBucket
+	limit   int
+	window  time.Duration
 }
 
 type rlBucket struct {

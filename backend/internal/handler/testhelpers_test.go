@@ -147,13 +147,17 @@ func newHandlerServerSharing(t *testing.T, _ *httptest.Server, userID, tenantID 
 	env := newTestEnvelope(t)
 	l := linker.New(store, env, nil)
 
+	links := NewLinks(l, store)
 	protected := http.NewServeMux()
-	NewLinks(l, store).Register(protected)
+	links.Register(protected)
+	messages := http.NewServeMux()
+	links.RegisterMessages(messages)
 
 	root := http.NewServeMux()
 	wrapped := stampIdentity(userID, tenantID)(protected)
 	root.Handle("/api/v1/links/", wrapped)
 	root.Handle("/api/v1/links", wrapped)
+	root.Handle("/api/v1/messages", stampIdentity(userID, tenantID)(messages))
 
 	srv := httptest.NewServer(root)
 	t.Cleanup(srv.Close)

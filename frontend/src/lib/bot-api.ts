@@ -105,12 +105,17 @@ export async function listLinks(): Promise<Link[]> {
   return Array.isArray(data) ? data : data.links;
 }
 
-/** Recent relay history for a single link (last N turns). */
+/**
+ * Recent relay history for a single link (last N turns).
+ *
+ * Served by the same `/messages` endpoint as the global search, scoped with
+ * `link_id` — there is no `/links/:id/messages` route (it would collide with
+ * `/links/codes/:code` in Go's ServeMux).
+ */
 export async function getLinkMessages(linkId: string, limit = 100): Promise<Message[]> {
-  const { data } = await api.get<{ messages: Message[] } | Message[]>(
-    `/links/${encodeURIComponent(linkId)}/messages`,
-    { params: { limit } },
-  );
+  const { data } = await api.get<{ messages: Message[] } | Message[]>('/messages', {
+    params: { link_id: linkId, limit },
+  });
   return Array.isArray(data) ? data : data.messages;
 }
 

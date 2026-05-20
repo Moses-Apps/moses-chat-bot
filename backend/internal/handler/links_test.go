@@ -39,13 +39,17 @@ func newHandlerServer(t *testing.T, userID, tenantID uuid.UUID) (*httptest.Serve
 	env := newTestEnvelope(t)
 	l := linker.New(store, env, nil)
 
+	links := NewLinks(l, store)
 	protected := http.NewServeMux()
-	NewLinks(l, store).Register(protected)
+	links.Register(protected)
+	messages := http.NewServeMux()
+	links.RegisterMessages(messages)
 
 	root := http.NewServeMux()
 	wrapped := stampIdentity(userID, tenantID)(protected)
 	root.Handle("/api/v1/links/", wrapped)
 	root.Handle("/api/v1/links", wrapped)
+	root.Handle("/api/v1/messages", stampIdentity(userID, tenantID)(messages))
 
 	srv := httptest.NewServer(root)
 	t.Cleanup(srv.Close)
@@ -184,6 +188,96 @@ func TestListLinksHandler_TenantIsolated(t *testing.T) {
 	var listB []map[string]interface{}
 	require.NoError(t, json.NewDecoder(respB.Body).Decode(&listB))
 	require.Len(t, listB, 0, "tenant B must not see tenant A's links")
+}
+
+func TestSearchMessages_LinkScoped_OK(t *testing.T) {
+	tenant := uuid.New()
+	user := uuid.New()
+	srv, l, store := newHandlerServer(t, user, tenant)
+	ctx := context.Background()
+
+	code, _, err := l.CreateCode(ctx, tenant, user, "plat", nil, 60*time.Second)
+	require.NoError(t, err)
+	l.RegisterKnown("telegram", "tg-msg")
+	link, err := l.CompleteLink(ctx, code, "telegram", "tg-msg")
+	require.NoError(t, err)
+
+	_, err = store.InsertMessage(ctx, link.ID, "in", nil, nil, "hello from telegram", nil, nil)
+	require.NoError(t, err)
+	_, err = store.InsertMessage(ctx, link.ID, "out", nil, nil, "reply from moses", nil, nil)
+	require.NoError(t, err)
+
+	resp, err := http.Get(srv.URL + "/api/v1/messages?link_id=" + link.ID.String())
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out struct {
+		Messages []struct {
+			ID         string `json:"id"`
+			LinkID     string `json:"linkId"`
+			Direction  string `json:"direction"`
+			Text       string `json:"text"`
+			OccurredAt string `json:"occurredAt"`
+		} `json:"messages"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.Len(t, out.Messages, 2)
+	for _, m := range out.Messages {
+		require.Equal(t, link.ID.String(), m.LinkID)
+		require.NotEmpty(t, m.OccurredAt)
+		require.Contains(t, []string{"in", "out"}, m.Direction)
+	}
+}
+
+func TestSearchMessages_ForeignLink_404(t *testing.T) {
+	tenant := uuid.New()
+	userA := uuid.New()
+	userB := uuid.New()
+	srvA, l, store := newHandlerServer(t, userA, tenant)
+	ctx := context.Background()
+
+	code, _, err := l.CreateCode(ctx, tenant, userA, "plat", nil, 60*time.Second)
+	require.NoError(t, err)
+	l.RegisterKnown("telegram", "tg-foreign")
+	link, err := l.CompleteLink(ctx, code, "telegram", "tg-foreign")
+	require.NoError(t, err)
+	_, err = store.InsertMessage(ctx, link.ID, "in", nil, nil, "private", nil, nil)
+	require.NoError(t, err)
+
+	// userB in the SAME tenant must not read userA's link messages — and the
+	// 404 must not leak that the link exists.
+	srvB, _, _ := newHandlerServerSharing(t, srvA, userB, tenant)
+	resp, err := http.Get(srvB.URL + "/api/v1/messages?link_id=" + link.ID.String())
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestSearchMessages_AcrossUserLinks(t *testing.T) {
+	tenant := uuid.New()
+	user := uuid.New()
+	srv, l, store := newHandlerServer(t, user, tenant)
+	ctx := context.Background()
+
+	code, _, err := l.CreateCode(ctx, tenant, user, "plat", nil, 60*time.Second)
+	require.NoError(t, err)
+	l.RegisterKnown("telegram", "tg-search")
+	link, err := l.CompleteLink(ctx, code, "telegram", "tg-search")
+	require.NoError(t, err)
+	_, err = store.InsertMessage(ctx, link.ID, "in", nil, nil, "searchable", nil, nil)
+	require.NoError(t, err)
+
+	resp, err := http.Get(srv.URL + "/api/v1/messages")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var out struct {
+		Messages []map[string]interface{} `json:"messages"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.Len(t, out.Messages, 1)
+	require.Equal(t, "searchable", out.Messages[0]["text"])
 }
 
 func TestRateLimit_TripsAfterBurst(t *testing.T) {

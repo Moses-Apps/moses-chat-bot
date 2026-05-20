@@ -185,9 +185,17 @@ func main() {
 	mux.Handle("/api/v1/providers/telegram/webhook", webhook)
 
 	protected := http.NewServeMux()
-	handler.NewLinks(link, store).Register(protected)
+	linksHandler := handler.NewLinks(link, store)
+	linksHandler.Register(protected)
 	mux.Handle("/api/v1/links/", middleware.RequireUser(mosesClient)(protected))
 	mux.Handle("/api/v1/links", middleware.RequireUser(mosesClient)(protected))
+
+	// Global cross-link message list/search for the in-app Messages page.
+	// Separate mux + mount because /api/v1/messages is outside the
+	// /api/v1/links prefix the protected mux is bound to.
+	messagesMux := http.NewServeMux()
+	linksHandler.RegisterMessages(messagesMux)
+	mux.Handle("/api/v1/messages", middleware.RequireUser(mosesClient)(messagesMux))
 
 	// Telegram bot configuration (moses-chat-bot-qcq): GET /info is a tenant
 	// read for any member; POST/DELETE /connect are tenant-admin gated.
@@ -261,4 +269,3 @@ func streamTimeoutFromEnv() time.Duration {
 	}
 	return d
 }
-
