@@ -12,11 +12,21 @@ import Messages from '@/pages/Messages';
 import Settings from '@/pages/Settings';
 import NotFound from '@/pages/NotFound';
 
-// import.meta.env.BASE_URL is the vite-injected base path. The fallback covers
-// jsdom / SSR-ish environments where Vite's typings aren't in play.
+// The React Router basename must be the RUNTIME deploy prefix, not the
+// build-time vite base. Vite is built with base './' so assets stay
+// prefix-relative, which makes import.meta.env.BASE_URL './' — not a valid
+// router basename. The nginx entrypoint injects the real MOSES_BASE_PATH
+// into <meta name="moses-base-path">; read that. Falls back to '/' for
+// standalone / jsdom where the tag is absent.
 function resolveBaseName(): string {
-  const env = (import.meta as { env?: { BASE_URL?: string } }).env;
-  return env?.BASE_URL ?? '/';
+  const content = document
+    .querySelector('meta[name="moses-base-path"]')
+    ?.getAttribute('content')
+    ?.trim();
+  if (content && content.startsWith('/')) {
+    return content.replace(/\/+$/, '') || '/';
+  }
+  return '/';
 }
 
 export default function App(): ReactElement {
