@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -58,6 +59,37 @@ func TestStartAutonomous(t *testing.T) {
 	require.NoError(t, json.Unmarshal(gotBody, &sent))
 	assert.Equal(t, "freeform", sent["mode"], "Mode must default to 'freeform' when omitted")
 	assert.Equal(t, float64(5), sent["max_concurrent_agents"])
+}
+
+// TestOptionalTime_UnmarshalJSON is the regression guard for the autopilot
+// decode failure: the platform types AutonomousSession.CompletedAt as
+// sql.NullTime, which marshals to {"Time":...,"Valid":bool} rather than a
+// bare string|null. Decoding that into a plain *time.Time used to fail the
+// whole /autonomous/start response with "input is not a JSON string".
+func TestOptionalTime_UnmarshalJSON(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantNil bool
+		wantRFC string
+	}{
+		{"null", `null`, true, ""},
+		{"sql.NullTime invalid (running session)", `{"Time":"0001-01-01T00:00:00Z","Valid":false}`, true, ""},
+		{"sql.NullTime valid (completed session)", `{"Time":"2026-05-20T09:51:23Z","Valid":true}`, false, "2026-05-20T09:51:23Z"},
+		{"plain RFC3339 string", `"2026-05-20T09:51:23Z"`, false, "2026-05-20T09:51:23Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ot optionalTime
+			require.NoError(t, json.Unmarshal([]byte(tc.raw), &ot))
+			if tc.wantNil {
+				assert.Nil(t, ot.Time)
+				return
+			}
+			require.NotNil(t, ot.Time)
+			assert.Equal(t, tc.wantRFC, ot.Time.UTC().Format(time.RFC3339))
+		})
+	}
 }
 
 func TestStopAutonomous(t *testing.T) {

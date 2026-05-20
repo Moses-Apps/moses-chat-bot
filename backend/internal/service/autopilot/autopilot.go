@@ -122,7 +122,7 @@ func New(store Store, factory ClientFactory, env *crypto.Envelope, sender Sender
 //  2. Pre-flight: GET /autonomous/active.
 //     - If a session exists AND owned by this user: "already running".
 //     - If a session exists AND owned by someone else: refuse — tenant
-//       singleton must not be silently stomped.
+//     singleton must not be silently stomped.
 //     - If nil: proceed.
 //  3. POST /autonomous/start with platform defaults (no overrides). On
 //     403 surface a friendly RBAC message.
@@ -466,8 +466,8 @@ func formatStatus(session *mosesclient.AutonomousSession) string {
 		),
 		fmt.Sprintf("Started: %s", session.CreatedAt.UTC().Format(time.RFC3339)),
 	}
-	if session.CompletedAt != nil {
-		lines = append(lines, fmt.Sprintf("Completed: %s", session.CompletedAt.UTC().Format(time.RFC3339)))
+	if session.CompletedAt.Time != nil {
+		lines = append(lines, fmt.Sprintf("Completed: %s", session.CompletedAt.Time.UTC().Format(time.RFC3339)))
 	}
 	if session.Summary != nil && *session.Summary != "" {
 		lines = append(lines, "Summary: "+*session.Summary)
