@@ -477,6 +477,44 @@ func TestHandleInbound_SlashLink_AlreadyLinked_Replies(t *testing.T) {
 	assert.Contains(t, sent[0].Msg.Text, "already linked")
 }
 
+func TestHandleInbound_SlashStart_Unlinked_RegistersAndWelcomes(t *testing.T) {
+	// Regression: a user with NO link sends /start. The link-resolution gate
+	// used to return before command dispatch, so /start never ran. It must
+	// now register the user as known and reply with the welcome.
+	fx := newFixture(t, newFakeSubscriber(8))
+	require.False(t, fx.relay.Linker.IsKnown("telegram", "tg-new"))
+
+	msg := provider.InboundMessage{
+		Provider: "telegram", ProviderUserID: "tg-new", ProviderChatID: "tg-new",
+		Text: "/start", ProviderMessageID: "ns-1", ReceivedAt: time.Now(),
+	}
+	require.NoError(t, fx.relay.HandleInbound(context.Background(), msg))
+	assert.True(t, fx.relay.Linker.IsKnown("telegram", "tg-new"))
+	sent := fx.tg.Snapshot()
+	require.Len(t, sent, 1)
+	assert.Contains(t, sent[0].Msg.Text, "Welcome")
+}
+
+func TestHandleInbound_SlashLink_Unlinked_ReachesLinker(t *testing.T) {
+	// Regression: /link from a not-yet-linked user must reach linker.
+	// CompleteLink — previously the no-link gate replied "I don't recognise
+	// you" and /link never ran, making linking impossible. Here the user is
+	// not known (no /start), so CompleteLink returns ErrUnknownUser, which
+	// the relay surfaces as a "send /start first" reply — proving /link is
+	// now dispatched for unlinked users.
+	fx := newFixture(t, newFakeSubscriber(8))
+
+	msg := provider.InboundMessage{
+		Provider: "telegram", ProviderUserID: "tg-nolink", ProviderChatID: "tg-nolink",
+		Text: "/link abc123", ProviderMessageID: "nl-1", ReceivedAt: time.Now(),
+	}
+	require.NoError(t, fx.relay.HandleInbound(context.Background(), msg))
+	sent := fx.tg.Snapshot()
+	require.Len(t, sent, 1)
+	assert.Contains(t, sent[0].Msg.Text, "/start")
+	assert.NotContains(t, sent[0].Msg.Text, "don't recognise")
+}
+
 func TestHandleInbound_SlashClear_ResetsConversation(t *testing.T) {
 	fx := newFixture(t, newFakeSubscriber(8))
 	link := seedLink(fx, "telegram", "tg-clear")

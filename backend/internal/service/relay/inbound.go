@@ -158,15 +158,22 @@ func (i *Inbound) HandleInbound(ctx context.Context, msg provider.InboundMessage
 		slog.String("provider_message_id", msg.ProviderMessageID),
 	)
 
+	// Parse the command up front — /start and /link are BOOTSTRAP commands
+	// that must work before any link exists (/link is what creates one).
+	cmd, parseErr := commands.Parse(msg.Text)
+
 	// 1. Resolve link
 	link, err := i.Store.GetActiveLinkByProviderUser(ctx, msg.Provider, msg.ProviderUserID)
 	if err != nil && !db.IsNoRows(err) {
 		logger.Error("resolve link", slog.String("err", err.Error()))
 		return fmt.Errorf("relay: resolve link: %w", err)
 	}
-	if err != nil || link == nil {
-		i.sendNoLinkReply(ctx, msg)
-		return nil
+
+	// 2. No link yet — only the bootstrap commands /start and /link are
+	//    actionable. /link is what CREATES the link, so it cannot itself
+	//    require one to already exist.
+	if link == nil {
+		return i.handleUnlinked(ctx, msg, cmd, parseErr, logger)
 	}
 	logger = logger.With(slog.String("link_id", link.ID.String()))
 
@@ -194,8 +201,7 @@ func (i *Inbound) HandleInbound(ctx context.Context, msg provider.InboundMessage
 	}
 	_ = i.Store.TouchLastUsed(ctx, link.TenantID, link.ID)
 
-	// 4. Slash command dispatch.
-	cmd, parseErr := commands.Parse(msg.Text)
+	// 4. Slash command dispatch (cmd/parseErr were parsed at the top).
 	if parseErr == nil {
 		handled, err := i.dispatchCommand(ctx, link, msg, cmd)
 		if err != nil {
@@ -314,6 +320,64 @@ func (i *Inbound) handleLinkCommand(
 	_ commands.Command,
 ) error {
 	return i.replyText(ctx, link, "You're already linked. Send `/unlink` first if you want to relink to a different account.")
+}
+
+// handleUnlinked processes a message from a provider user with no active
+// link. Only the bootstrap commands /start and /link are actionable —
+// /link is what mints the link. Anything else gets linking instructions.
+func (i *Inbound) handleUnlinked(
+	ctx context.Context,
+	msg provider.InboundMessage,
+	cmd commands.Command,
+	parseErr error,
+	logger *slog.Logger,
+) error {
+	if parseErr == nil && cmd.Verb == "/start" {
+		i.Linker.RegisterKnown(msg.Provider, msg.ProviderUserID)
+		i.replyUnlinked(ctx, msg, "Welcome! Generate a 6-digit code in your Moses chat-bot app, then send `/link <code>` here to connect this chat to your Moses account.")
+		return nil
+	}
+	if parseErr == nil && cmd.Verb == "/link" {
+		if len(cmd.Args) == 0 {
+			i.replyUnlinked(ctx, msg, "Usage: `/link <code>`. Generate the 6-digit code in your Moses chat-bot app first.")
+			return nil
+		}
+		i.replyUnlinked(ctx, msg, i.completeLink(ctx, msg, cmd.Args[0], logger))
+		return nil
+	}
+	i.sendNoLinkReply(ctx, msg)
+	return nil
+}
+
+// completeLink runs the /link code-claim for a not-yet-linked provider user
+// and returns the user-facing reply. linker.CompleteLink does the real work
+// (known-user gate, lockout, code validation, pending→link copy).
+func (i *Inbound) completeLink(
+	ctx context.Context,
+	msg provider.InboundMessage,
+	code string,
+	logger *slog.Logger,
+) string {
+	link, err := i.Linker.CompleteLink(ctx, code, msg.Provider, msg.ProviderUserID)
+	if err != nil {
+		switch {
+		case errors.Is(err, linker.ErrUnknownUser):
+			return "Send `/start` first, then `/link <code>`."
+		case errors.Is(err, linker.ErrLockedOut):
+			return "Too many failed attempts. Please wait a few minutes, then try again."
+		case errors.Is(err, linker.ErrInvalidCode):
+			return "That code is invalid. Generate a fresh one in your Moses chat-bot app and send `/link <code>` again."
+		case errors.Is(err, linker.ErrExpired):
+			return "That code has expired — codes last 60 seconds. Generate a fresh one and send `/link <code>` again."
+		case errors.Is(err, linker.ErrAlreadyLinked):
+			return "This Telegram account is already linked. Send `/unlink` first to relink to a different account."
+		default:
+			logger.Error("complete link", slog.String("err", err.Error()))
+			return "Something went wrong linking your account. Please try again in a moment."
+		}
+	}
+	logger.Info("link completed via /link", slog.String("link_id", link.ID.String()))
+	return "Linked! You can now message Moses from this chat — send anything to talk to your Moses Manager."
 }
 
 // replyText is the shared helper every command branch funnels through to
@@ -549,21 +613,25 @@ func (i *Inbound) handleUnauthorized(ctx context.Context, link *db.ChatRelayLink
 	}, nil)
 }
 
-// sendNoLinkReply replies to an unrecognised provider user with linking
-// instructions. We do NOT persist this — there's no link row to anchor to.
-func (i *Inbound) sendNoLinkReply(ctx context.Context, msg provider.InboundMessage) {
+// replyUnlinked sends a plain-text reply to a provider user who has no link
+// row to anchor to. NOT persisted — there is no link to attach the audit
+// row to. Goes straight to the provider adapter.
+func (i *Inbound) replyUnlinked(ctx context.Context, msg provider.InboundMessage, text string) {
 	p, ok := i.Registry.Get(msg.Provider)
 	if !ok {
-		i.Logger.Warn("no-link reply but provider not registered", slog.String("provider", msg.Provider))
+		i.Logger.Warn("unlinked reply but provider not registered", slog.String("provider", msg.Provider))
 		return
 	}
 	chat := provider.ChatRef{Provider: msg.Provider, ProviderChatID: msg.ProviderChatID}
-	out := provider.OutboundMessage{
-		Text: "I don't recognise you yet. Send `/link <code>` from your Moses UI to connect this chat to your account.",
+	if err := p.SendMessage(ctx, chat, provider.OutboundMessage{Text: text}); err != nil {
+		i.Logger.Warn("unlinked reply failed", slog.String("err", err.Error()))
 	}
-	if err := p.SendMessage(ctx, chat, out); err != nil {
-		i.Logger.Warn("no-link reply failed", slog.String("err", err.Error()))
-	}
+}
+
+// sendNoLinkReply replies to an unrecognised provider user with the linking
+// instructions: register with /start, then claim a code with /link.
+func (i *Inbound) sendNoLinkReply(ctx context.Context, msg provider.InboundMessage) {
+	i.replyUnlinked(ctx, msg, "I don't recognise this chat yet. Send `/start`, then generate a 6-digit code in your Moses chat-bot app and send `/link <code>` here to connect.")
 }
 
 // buildInboundMetadata captures provider context that may be useful for
