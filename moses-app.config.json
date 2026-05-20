@@ -43,7 +43,7 @@
       {
         "type": "moses-platform",
         "key": "default",
-        "scopes": ["chat_relay", "workspace_push"],
+        "scopes": ["users:read", "users:list", "tenant:read"],
         "envMapping": { "apiKey": "MOSES_PLATFORM_API_KEY", "apiUrl": "MOSES_PLATFORM_API_URL" }
       }
     ]
