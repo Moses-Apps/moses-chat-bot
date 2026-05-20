@@ -12,16 +12,39 @@ data:
   postgresql-password: {{ .Values.postgres.auth.password | b64enc | quote }}
 ---
 {{- end }}
+# Standalone PVC — NOT a StatefulSet volumeClaimTemplate. A StatefulSet's
+# spec is immutable on most fields, so Helm `upgrade` (every Moses re-deploy)
+# fails with "Forbidden: updates to statefulset spec ... are forbidden". A
+# Deployment + standalone PVC is fully upgradeable.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "moses-chat-bot.postgresFullname" . }}-data
+  labels:
+    {{- include "moses-chat-bot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- if .Values.postgres.storage.storageClassName }}
+  storageClassName: {{ .Values.postgres.storage.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.postgres.storage.size | quote }}
+---
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: {{ include "moses-chat-bot.postgresFullname" . }}
   labels:
     {{- include "moses-chat-bot.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgres
 spec:
-  serviceName: {{ include "moses-chat-bot.postgresFullname" . }}
   replicas: 1
+  # Recreate, not RollingUpdate: the data PVC is ReadWriteOnce, so the old
+  # pod must release it before the new pod can mount it.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "moses-chat-bot.selectorLabels" . | nindent 6 }}
@@ -77,20 +100,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-        labels:
-          {{- include "moses-chat-bot.labels" . | nindent 10 }}
-          app.kubernetes.io/component: postgres
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        {{- if .Values.postgres.storage.storageClassName }}
-        storageClassName: {{ .Values.postgres.storage.storageClassName | quote }}
-        {{- end }}
-        resources:
-          requests:
-            storage: {{ .Values.postgres.storage.size | quote }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "moses-chat-bot.postgresFullname" . }}-data
 ---
 apiVersion: v1
 kind: Service
@@ -101,8 +114,6 @@ metadata:
     app.kubernetes.io/component: postgres
 spec:
   type: ClusterIP
-  # Headless-ish: a stable ClusterIP keeps DATABASE_URL simple. Switch
-  # to clusterIP: None if you later add replicas + DNS-based discovery.
   ports:
     - port: 5432
       targetPort: postgres
