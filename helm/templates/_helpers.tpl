@@ -53,17 +53,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Service account name.
-*/}}
-{{- define "moses-chat-bot.serviceAccountName" -}}
-{{- if .Values.serviceAccount.create }}
-{{- default (include "moses-chat-bot.fullname" .) .Values.serviceAccount.name }}
-{{- else }}
-{{- default "default" .Values.serviceAccount.name }}
-{{- end }}
-{{- end }}
-
-{{/*
 Postgres service name (also used as host for DATABASE_URL).
 */}}
 {{- define "moses-chat-bot.postgresFullname" -}}

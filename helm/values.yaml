@@ -104,19 +104,12 @@ masterKey:
   # Override to use a pre-existing Secret (key = `master-key.json`).
   existingSecret: ""
 
-ingress:
-  enabled: true
-  className: ""
-  host: "chart-example.local"
-  path: "/"
-  pathType: Prefix
-  tls: []
-  annotations: {}
-
-serviceAccount:
-  create: true
-  name: ""
-  annotations: {}
+# NOTE: this app does not ship its own Ingress or ServiceAccount. Moses
+# provisions the namespace, RBAC, ServiceAccount, and ingress route for
+# every deployed app — matching the moses-default-app-templates convention.
+# A chart-supplied ServiceAccount/Ingress fails Helm's pre-install resource
+# check because the moses-backend SA cannot get those resources in a tenant
+# project namespace.
 
 podSecurityContext: {}
 securityContext: {}

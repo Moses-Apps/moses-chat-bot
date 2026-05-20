@@ -1,12 +1,9 @@
 moses-chat-bot v{{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}".
 
 Access:
-{{- if .Values.ingress.enabled }}
-  http{{ if .Values.ingress.tls }}s{{ end }}://{{ .Values.ingress.host }}{{ .Values.ingress.path }}
-{{- else }}
-  Ingress disabled — port-forward to test:
+  Moses provisions the ingress route for this app — open it from the Moses
+  Apps page. To test directly, port-forward:
     kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "moses-chat-bot.fullname" . }}-frontend {{ .Values.service.frontend.port }}:{{ .Values.service.frontend.port }}
-{{- end }}
 
 Next steps:
   1. Provision a Telegram bot via @BotFather and obtain the bot token.
