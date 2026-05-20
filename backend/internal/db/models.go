@@ -45,6 +45,21 @@ type ChatRelayMessage struct {
 	Error               *string    `db:"error"`
 }
 
+// TelegramBotConfig is the per-tenant Telegram bot connection (one row per
+// tenant). EncryptedToken holds the BotFather token sealed under the per-tenant
+// crypto envelope; EncryptionKeyID names the master-key version used.
+type TelegramBotConfig struct {
+	TenantID          uuid.UUID `db:"tenant_id"`
+	EncryptedToken    []byte    `db:"encrypted_token"`
+	EncryptionKeyID   string    `db:"encryption_key_id"`
+	BotID             *int64    `db:"bot_id"`
+	BotUsername       *string   `db:"bot_username"`
+	WebhookSecret     string    `db:"webhook_secret"`
+	ConnectedByUserID uuid.UUID `db:"connected_by_user_id"`
+	ConnectedAt       time.Time `db:"connected_at"`
+	UpdatedAt         time.Time `db:"updated_at"`
+}
+
 type ProviderChatState struct {
 	ID                  uuid.UUID  `db:"id"`
 	LinkID              uuid.UUID  `db:"link_id"`

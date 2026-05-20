@@ -177,3 +177,61 @@ func TestAPI_DeleteWebhook_OK(t *testing.T) {
 		t.Fatalf("DeleteWebhook: %v", err)
 	}
 }
+
+func TestAPI_GetMe_OK(t *testing.T) {
+	client, _ := newTestAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bottest-token/getMe" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		fmt.Fprint(w, `{"ok":true,"result":{"id":777,"is_bot":true,"username":"moses_demo_bot"}}`)
+	})
+	me, err := client.GetMe(context.Background())
+	if err != nil {
+		t.Fatalf("GetMe: %v", err)
+	}
+	if me.ID != 777 || me.Username != "moses_demo_bot" || !me.IsBot {
+		t.Fatalf("unexpected BotUser: %+v", me)
+	}
+}
+
+func TestAPI_GetMe_InvalidToken_TypedError(t *testing.T) {
+	client, _ := newTestAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"ok":false,"error_code":401,"description":"Unauthorized"}`)
+	})
+	_, err := client.GetMe(context.Background())
+	if err == nil {
+		t.Fatal("expected error for invalid token")
+	}
+	te, ok := AsTelegramError(err)
+	if !ok {
+		t.Fatalf("expected *telegramError, got %T: %v", err, err)
+	}
+	if te.Code() != 401 {
+		t.Fatalf("expected error_code 401, got %d", te.Code())
+	}
+}
+
+func TestAPI_SetMyCommands_RequestShape(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	client, _ := newTestAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		fmt.Fprint(w, `{"ok":true,"result":true}`)
+	})
+	err := client.SetMyCommands(context.Background(), SetMyCommandsParams{
+		Commands: []BotCommand{{Command: "start", Description: "Welcome"}},
+	})
+	if err != nil {
+		t.Fatalf("SetMyCommands: %v", err)
+	}
+	if gotPath != "/bottest-token/setMyCommands" {
+		t.Fatalf("unexpected path %s", gotPath)
+	}
+	cmds, ok := gotBody["commands"].([]any)
+	if !ok || len(cmds) != 1 {
+		t.Fatalf("unexpected commands payload: %v", gotBody["commands"])
+	}
+}

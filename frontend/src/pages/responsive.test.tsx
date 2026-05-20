@@ -6,7 +6,7 @@
 // 1280 px viewports.
 
 import { describe, expect, it, beforeEach, vi } from 'vitest';
-import { render } from '@testing-library/react';
+import { render, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { Link } from '@/lib/bot-api';
 
@@ -17,6 +17,9 @@ vi.mock('@/lib/bot-api', async () => {
     listLinks: vi.fn().mockResolvedValue([]),
     getLinkMessages: vi.fn().mockResolvedValue([]),
     deleteLink: vi.fn(),
+    // LinkNew now gates on the tenant bot status; a connected bot lets the
+    // provider picker render so the responsive classes can be asserted.
+    getTelegramInfo: vi.fn().mockResolvedValue({ configured: true, username: 'moses_test_bot' }),
   };
 });
 
@@ -45,11 +48,15 @@ describe('responsive layout classes', () => {
     expect(container.querySelector('.lg\\:col-span-2')).not.toBeNull();
   });
 
-  it('LinkNew provider picker is 1-col on small, 2-col on sm+', () => {
+  it('LinkNew provider picker is 1-col on small, 2-col on sm+', async () => {
     const { container } = render(
       <MemoryRouter>
         <LinkNew />
       </MemoryRouter>,
+    );
+    // The picker only renders once the bot-status check resolves.
+    await waitFor(() =>
+      expect(container.querySelector('[role="radiogroup"]')).not.toBeNull(),
     );
     const radiogroup = container.querySelector('[role="radiogroup"]');
     expect(radiogroup).not.toBeNull();

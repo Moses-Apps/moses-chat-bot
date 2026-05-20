@@ -1,0 +1,327 @@
+// ConnectTelegram — tenant-admin "Connect Telegram" wizard (moses-chat-bot-qcq).
+//
+// Telegram bots can ONLY be created by a human via @BotFather — there is no
+// API or OAuth path. This wizard therefore does NOT emulate BotFather; it hands
+// the admin off via a https://t.me/botfather deep link, gives copy-paste-ready
+// commands, then takes the resulting token back through a paste field and
+// POSTs it to the backend (which validates it, encrypts it at rest, and
+// registers the webhook).
+//
+// The route is admin-gated: a non-admin viewer sees a "permission required"
+// card instead of the wizard.
+
+import { useCallback, useEffect, useState, type ReactElement } from 'react';
+import { Link as RouterLink } from 'react-router-dom';
+
+import BentoCard from '@/components/layout/BentoCard';
+import { getViewer } from '@/lib/platform';
+import {
+  getTelegramInfo,
+  connectTelegram,
+  disconnectTelegram,
+  type TelegramBotInfo,
+} from '@/lib/bot-api';
+import type { ApiError } from '@/lib/api';
+
+const BOTFATHER_URL = 'https://t.me/botfather';
+
+// The exact messages an admin sends to BotFather, in order. /newbot starts the
+// flow; BotFather then prompts for a display name and a username (which must
+// end in "bot").
+const BOTFATHER_STEPS = [
+  { label: 'Send this command to start a new bot', value: '/newbot' },
+  {
+    label: 'When asked for a name, reply with a display name',
+    value: 'Moses Assistant',
+  },
+  {
+    label: 'When asked for a username, reply with one ending in "bot"',
+    value: 'moses_yourworkspace_bot',
+  },
+];
+
+type Gate = 'checking' | 'allowed' | 'forbidden';
+
+function toApiError(err: unknown): ApiError {
+  if (err && typeof err === 'object' && 'status' in err && 'message' in err) {
+    return err as ApiError;
+  }
+  return {
+    status: 0,
+    code: 'unknown',
+    message: err instanceof Error ? err.message : 'Unknown error',
+  };
+}
+
+/** Small copy-to-clipboard button reused for each BotFather command. */
+function CopyField({ value, label }: { value: string; label: string }): ReactElement {
+  const [copied, setCopied] = useState(false);
+
+  const onCopy = useCallback(async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 2000);
+      }
+    } catch {
+      /* best-effort; the value is visible for manual copy */
+    }
+  }, [value]);
+
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-xs text-moses-text-muted">{label}</span>
+      <div className="flex items-center gap-2">
+        <code className="flex-1 truncate rounded-bento border border-moses-border bg-moses-surface px-3 py-2 font-mono text-sm dark:border-moses-border-dark dark:bg-moses-surface-dark">
+          {value}
+        </code>
+        <button
+          type="button"
+          onClick={() => void onCopy()}
+          className="min-h-[44px] shrink-0 rounded-bento border border-moses-border bg-moses-surface-raised px-3 text-sm font-medium text-moses-text hover:bg-moses-surface-sunken focus:outline-none focus:ring-2 focus:ring-moses-accent/40 dark:border-moses-border-dark dark:bg-moses-surface-dark-raised dark:text-moses-text-inverse"
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export default function ConnectTelegram(): ReactElement {
+  const [gate, setGate] = useState<Gate>('checking');
+  const [info, setInfo] = useState<TelegramBotInfo | null>(null);
+  const [token, setToken] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // On mount: gate on admin status, then load the current connection state.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const viewer = await getViewer();
+        if (cancelled) return;
+        if (!viewer.isTenantAdmin) {
+          setGate('forbidden');
+          return;
+        }
+        setGate('allowed');
+        const current = await getTelegramInfo();
+        if (!cancelled) setInfo(current);
+      } catch (err) {
+        if (cancelled) return;
+        // If we can't confirm admin status, fail closed.
+        setGate('forbidden');
+        setError(toApiError(err).message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onConnect = useCallback(async () => {
+    const trimmed = token.trim();
+    if (!trimmed) {
+      setError('Paste the token BotFather gave you.');
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      const result = await connectTelegram(trimmed);
+      setInfo(result);
+      setToken('');
+    } catch (err) {
+      setError(toApiError(err).message || 'Could not connect the bot.');
+    } finally {
+      setSubmitting(false);
+    }
+  }, [token]);
+
+  const onDisconnect = useCallback(async () => {
+    setDisconnecting(true);
+    setError(null);
+    try {
+      await disconnectTelegram();
+      setInfo({ configured: false });
+    } catch (err) {
+      setError(toApiError(err).message || 'Could not disconnect the bot.');
+    } finally {
+      setDisconnecting(false);
+    }
+  }, []);
+
+  if (gate === 'checking') {
+    return (
+      <div className="grid grid-cols-1 gap-4">
+        <BentoCard title="Connect Telegram">
+          <p className="text-sm text-moses-text-muted" aria-live="polite">
+            Checking your permissions…
+          </p>
+        </BentoCard>
+      </div>
+    );
+  }
+
+  if (gate === 'forbidden') {
+    return (
+      <div className="grid grid-cols-1 gap-4">
+        <BentoCard
+          title="Tenant admin required"
+          subtitle="Only administrators can connect a Telegram bot"
+        >
+          <p className="text-sm text-moses-text-muted">
+            Connecting a Telegram bot for the whole workspace is an
+            administrator action. Ask a tenant admin to set this up.
+          </p>
+          {error && (
+            <p role="alert" className="mt-3 text-sm text-moses-status-error">
+              {error}
+            </p>
+          )}
+          <RouterLink
+            to="/"
+            className="mt-4 inline-flex min-h-[44px] items-center rounded-bento border border-moses-border bg-moses-surface-raised px-4 text-sm font-medium text-moses-text hover:bg-moses-surface-sunken focus:outline-none focus:ring-2 focus:ring-moses-accent/40 dark:border-moses-border-dark dark:bg-moses-surface-dark-raised dark:text-moses-text-inverse"
+          >
+            Back to dashboard
+          </RouterLink>
+        </BentoCard>
+      </div>
+    );
+  }
+
+  // gate === 'allowed' — render the wizard or the connected state.
+  if (info?.configured) {
+    return (
+      <div className="grid grid-cols-1 gap-4">
+        <BentoCard
+          title="Telegram bot connected"
+          subtitle="Your workspace can now link Telegram chats"
+        >
+          <div className="flex flex-col gap-4">
+            <div className="flex items-center gap-3 rounded-bento border border-moses-status-active/40 bg-moses-status-active/10 p-4">
+              <span
+                aria-hidden="true"
+                className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-moses-status-active/15 text-moses-status-active"
+              >
+                <svg viewBox="0 0 24 24" className="h-6 w-6">
+                  <path
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="3"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M5 12l5 5 9-11"
+                  />
+                </svg>
+              </span>
+              <div>
+                <p className="font-semibold">Connected</p>
+                <p className="text-sm text-moses-text-muted">
+                  Bot handle:{' '}
+                  <span className="font-mono">
+                    {info.username ? `@${info.username}` : 'unknown'}
+                  </span>
+                </p>
+              </div>
+            </div>
+            <p className="text-sm text-moses-text-muted">
+              Workspace members can now link their Telegram chat from{' '}
+              <RouterLink to="/link/new" className="text-moses-accent hover:underline">
+                Link a chat
+              </RouterLink>
+              . The webhook and command menu were configured automatically — no
+              redeploy needed.
+            </p>
+            {error && (
+              <p role="alert" className="text-sm text-moses-status-error">
+                {error}
+              </p>
+            )}
+            <button
+              type="button"
+              onClick={() => void onDisconnect()}
+              disabled={disconnecting}
+              className="self-start min-h-[44px] rounded-bento border border-moses-status-error/50 bg-moses-surface-raised px-4 text-sm font-medium text-moses-status-error hover:bg-moses-status-error/10 focus:outline-none focus:ring-2 focus:ring-moses-status-error/40 disabled:opacity-50 dark:bg-moses-surface-dark-raised"
+            >
+              {disconnecting ? 'Disconnecting…' : 'Disconnect bot'}
+            </button>
+          </div>
+        </BentoCard>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-1 gap-4">
+      <BentoCard
+        title="Create a bot with BotFather"
+        subtitle="Step 1 of 2 — Telegram requires a human to create the bot"
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-sm text-moses-text-muted">
+            Telegram bots can only be created in the Telegram app through its
+            official @BotFather account. Open BotFather and send these three
+            messages in order — BotFather will reply with a token at the end.
+          </p>
+          <a
+            href={BOTFATHER_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex min-h-[44px] w-fit items-center rounded-bento bg-moses-accent px-4 text-sm font-semibold text-white hover:bg-moses-accent-hover focus:outline-none focus:ring-2 focus:ring-moses-accent/40"
+          >
+            Open @BotFather in Telegram
+          </a>
+          <ol className="flex flex-col gap-3">
+            {BOTFATHER_STEPS.map((s, i) => (
+              <li key={s.value} className="flex flex-col gap-1">
+                <CopyField label={`${i + 1}. ${s.label}`} value={s.value} />
+              </li>
+            ))}
+          </ol>
+          <p className="text-xs text-moses-text-subtle">
+            The display name and username above are examples — pick your own.
+            The username must be unique and end in "bot".
+          </p>
+        </div>
+      </BentoCard>
+
+      <BentoCard
+        title="Paste the bot token"
+        subtitle="Step 2 of 2 — BotFather sends a token like 123456789:ABC…"
+      >
+        <div className="flex flex-col gap-4">
+          <label htmlFor="telegram-token" className="flex flex-col gap-1">
+            <span className="text-sm font-medium">Bot token from BotFather</span>
+            <input
+              id="telegram-token"
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="123456789:AAExampleTokenFromBotFather"
+              className="min-h-[44px] rounded-bento border border-moses-border bg-moses-surface px-3 font-mono text-sm text-moses-text focus:outline-none focus:ring-2 focus:ring-moses-accent/40 dark:border-moses-border-dark dark:bg-moses-surface-dark dark:text-moses-text-inverse"
+            />
+          </label>
+          {error && (
+            <p role="alert" className="text-sm text-moses-status-error">
+              {error}
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={() => void onConnect()}
+            disabled={submitting || token.trim() === ''}
+            className="self-start min-h-[44px] rounded-bento bg-moses-accent px-4 text-sm font-semibold text-white hover:bg-moses-accent-hover focus:outline-none focus:ring-2 focus:ring-moses-accent/40 disabled:opacity-50"
+          >
+            {submitting ? 'Connecting…' : 'Connect bot'}
+          </button>
+        </div>
+      </BentoCard>
+    </div>
+  );
+}

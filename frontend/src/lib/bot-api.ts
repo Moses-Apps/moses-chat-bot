@@ -51,6 +51,38 @@ export interface Message {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * Per-tenant Telegram bot connection status (moses-chat-bot-qcq).
+ *
+ * `configured` is false until a tenant admin connects a bot via the in-app
+ * wizard; `username` carries the real @username (without the @) when connected.
+ */
+export interface TelegramBotInfo {
+  configured: boolean;
+  username?: string;
+}
+
+/** GET /provider/telegram/info — readable by any tenant member. */
+export async function getTelegramInfo(): Promise<TelegramBotInfo> {
+  const { data } = await api.get<TelegramBotInfo>('/provider/telegram/info');
+  return data;
+}
+
+/**
+ * POST /provider/telegram/connect — tenant-admin only. Hands the backend the
+ * token a tenant admin obtained from @BotFather; the backend validates it,
+ * registers the webhook, and returns the connected bot's @username.
+ */
+export async function connectTelegram(token: string): Promise<TelegramBotInfo> {
+  const { data } = await api.post<TelegramBotInfo>('/provider/telegram/connect', { token });
+  return data;
+}
+
+/** DELETE /provider/telegram/connect — tenant-admin only. */
+export async function disconnectTelegram(): Promise<void> {
+  await api.delete('/provider/telegram/connect');
+}
+
 /** Create a 6-digit linking code (SPEC.md §4 step 4). */
 export async function createLinkCode(
   request: CreateLinkCodeRequest,

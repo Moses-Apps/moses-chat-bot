@@ -10,6 +10,7 @@ import LinkNew from '@/pages/LinkNew';
 import LinkDetail from '@/pages/LinkDetail';
 import Messages from '@/pages/Messages';
 import Settings from '@/pages/Settings';
+import ConnectTelegram from '@/pages/ConnectTelegram';
 import NotFound from '@/pages/NotFound';
 import { mosesBasePath } from '@/lib/basePath';
 
@@ -29,6 +30,8 @@ export default function App(): ReactElement {
           <Route path="/links/:id" element={<LinkDetail />} />
           <Route path="/messages" element={<Messages />} />
           <Route path="/settings" element={<Settings />} />
+          {/* Admin-gated in the page itself (ConnectTelegram checks /auth/me). */}
+          <Route path="/settings/telegram" element={<ConnectTelegram />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </PageShell>

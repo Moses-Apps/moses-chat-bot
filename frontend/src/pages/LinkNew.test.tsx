@@ -9,6 +9,7 @@ import { axe } from 'jest-axe';
 vi.mock('@/lib/platform', () => ({
   createMcpKey: vi.fn(),
   revokeMcpKey: vi.fn(),
+  getViewer: vi.fn(),
 }));
 vi.mock('@/lib/bot-api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/bot-api')>('@/lib/bot-api');
@@ -16,11 +17,12 @@ vi.mock('@/lib/bot-api', async () => {
     ...actual,
     createLinkCode: vi.fn(),
     pollLinkCode: vi.fn(),
+    getTelegramInfo: vi.fn(),
   };
 });
 
-import { createMcpKey, revokeMcpKey } from '@/lib/platform';
-import { createLinkCode, pollLinkCode } from '@/lib/bot-api';
+import { createMcpKey, revokeMcpKey, getViewer } from '@/lib/platform';
+import { createLinkCode, pollLinkCode, getTelegramInfo } from '@/lib/bot-api';
 import LinkNew from './LinkNew';
 
 const PLAINTEXT_KEY = 'mk_super_secret_xyz_should_never_leak';
@@ -38,6 +40,14 @@ function renderLinkNew(initial = '/link/new') {
   );
 }
 
+// waitForPick resolves once the bot-status check completes and the provider
+// picker is on screen — every mint/poll test starts there.
+async function waitForPick(): Promise<void> {
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: /generate code/i })).toBeInTheDocument(),
+  );
+}
+
 beforeEach(() => {
   vi.mocked(createMcpKey).mockReset();
   vi.mocked(revokeMcpKey).mockReset();
@@ -45,6 +55,14 @@ beforeEach(() => {
   vi.mocked(revokeMcpKey).mockResolvedValue(undefined);
   vi.mocked(createLinkCode).mockReset();
   vi.mocked(pollLinkCode).mockReset();
+  vi.mocked(getTelegramInfo).mockReset();
+  vi.mocked(getViewer).mockReset();
+  // Default: a bot IS connected, so the flow lands on the provider picker.
+  vi.mocked(getTelegramInfo).mockResolvedValue({
+    configured: true,
+    username: 'moses_test_bot',
+  });
+  vi.mocked(getViewer).mockResolvedValue({ isTenantAdmin: false });
 
   // crypto.randomUUID may not exist on jsdom.
   if (!('crypto' in globalThis) || !globalThis.crypto.randomUUID) {
@@ -63,13 +81,69 @@ afterEach(() => {
 });
 
 describe('<LinkNew />', () => {
-  it('only enables Telegram in the provider picker', () => {
+  it('shows an honest "no bot connected" message when configured=false (non-admin)', async () => {
+    vi.mocked(getTelegramInfo).mockResolvedValueOnce({ configured: false });
+    vi.mocked(getViewer).mockResolvedValueOnce({ isTenantAdmin: false });
+
     renderLinkNew();
+
+    await waitFor(() =>
+      expect(screen.getByText(/no telegram bot connected yet/i)).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByText(/your tenant admin has not connected a telegram bot yet/i),
+    ).toBeInTheDocument();
+    // A non-admin must NOT see the Connect wizard link.
+    expect(screen.queryByRole('link', { name: /connect telegram/i })).toBeNull();
+  });
+
+  it('offers the Connect wizard link to a tenant admin when no bot is connected', async () => {
+    vi.mocked(getTelegramInfo).mockResolvedValueOnce({ configured: false });
+    vi.mocked(getViewer).mockResolvedValueOnce({ isTenantAdmin: true });
+
+    renderLinkNew();
+
+    const wizardLink = await screen.findByRole('link', { name: /connect telegram/i });
+    expect(wizardLink).toHaveAttribute('href', '/settings/telegram');
+  });
+
+  it('never shows a fabricated @moses_<tenant>_bot handle', async () => {
+    const { container } = renderLinkNew();
+    await waitForPick();
+    expect(container.innerHTML).not.toContain('@moses_');
+    expect(container.innerHTML).not.toContain('<tenant>');
+  });
+
+  it('only enables Telegram in the provider picker', async () => {
+    renderLinkNew();
+    await waitForPick();
     const telegram = screen.getByRole('radio', { name: /telegram/i }) as HTMLInputElement;
     const discord = screen.getByRole('radio', { name: /discord/i }) as HTMLInputElement;
     expect(telegram.disabled).toBe(false);
     expect(telegram.checked).toBe(true);
     expect(discord.disabled).toBe(true);
+  });
+
+  it('shows the real bot @username in the claim instructions', async () => {
+    vi.mocked(getTelegramInfo).mockResolvedValueOnce({
+      configured: true,
+      username: 'moses_acme_bot',
+    });
+    vi.mocked(createMcpKey).mockResolvedValueOnce({ keyId: KEY_ID, key: PLAINTEXT_KEY });
+    vi.mocked(createLinkCode).mockResolvedValueOnce({
+      code: CODE,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    vi.mocked(pollLinkCode).mockResolvedValue({ status: 'pending' });
+
+    renderLinkNew();
+    await waitForPick();
+    fireEvent.click(screen.getByRole('button', { name: /generate code/i }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/enter this code in telegram/i)).toBeInTheDocument(),
+    );
+    expect(screen.getByText('@moses_acme_bot')).toBeInTheDocument();
   });
 
   it('calls createMcpKey then createLinkCode in order on Generate', async () => {
@@ -81,6 +155,7 @@ describe('<LinkNew />', () => {
     vi.mocked(pollLinkCode).mockResolvedValue({ status: 'pending' });
 
     const { container } = renderLinkNew();
+    await waitForPick();
     fireEvent.click(screen.getByRole('button', { name: /generate code/i }));
 
     await waitFor(() => expect(createMcpKey).toHaveBeenCalledTimes(1));
@@ -116,6 +191,7 @@ describe('<LinkNew />', () => {
     vi.mocked(pollLinkCode).mockResolvedValue({ status: 'pending' });
 
     renderLinkNew();
+    await waitForPick();
     fireEvent.click(screen.getByRole('button', { name: /generate code/i }));
     await waitFor(() => expect(screen.getByTestId('countdown-value')).toBeInTheDocument());
 
@@ -137,6 +213,7 @@ describe('<LinkNew />', () => {
     });
 
     renderLinkNew();
+    await waitForPick();
     fireEvent.click(screen.getByRole('button', { name: /generate code/i }));
 
     await waitFor(() => expect(screen.getByText(/linked successfully/i)).toBeInTheDocument());
@@ -165,6 +242,7 @@ describe('<LinkNew />', () => {
     vi.mocked(revokeMcpKey).mockResolvedValueOnce(undefined);
 
     renderLinkNew();
+    await waitForPick();
     fireEvent.click(screen.getByRole('button', { name: /generate code/i }));
 
     await waitFor(() => expect(screen.getByText(/code expired/i)).toBeInTheDocument());
@@ -178,6 +256,18 @@ describe('<LinkNew />', () => {
   // missing — added here as part of the CHAT-y3u follow-up.
   it('has no axe violations in the provider-pick state', async () => {
     const { container } = renderLinkNew();
+    await waitForPick();
+    const results = await axe(container);
+    expect(results).toHaveNoViolations();
+  });
+
+  it('has no axe violations in the not-connected state', async () => {
+    vi.mocked(getTelegramInfo).mockResolvedValueOnce({ configured: false });
+    vi.mocked(getViewer).mockResolvedValueOnce({ isTenantAdmin: true });
+    const { container } = renderLinkNew();
+    await waitFor(() =>
+      expect(screen.getByText(/no telegram bot connected yet/i)).toBeInTheDocument(),
+    );
     const results = await axe(container);
     expect(results).toHaveNoViolations();
   });
@@ -191,6 +281,7 @@ describe('<LinkNew />', () => {
     vi.mocked(pollLinkCode).mockResolvedValue({ status: 'pending' });
 
     const { container } = renderLinkNew();
+    await waitForPick();
     fireEvent.click(screen.getByRole('button', { name: /generate code/i }));
     await waitFor(() =>
       expect(screen.getByText(/enter this code in telegram/i)).toBeInTheDocument(),
@@ -210,6 +301,7 @@ describe('<LinkNew />', () => {
     vi.mocked(revokeMcpKey).mockResolvedValueOnce(undefined);
 
     renderLinkNew();
+    await waitForPick();
     fireEvent.click(screen.getByRole('button', { name: /generate code/i }));
     await waitFor(() => expect(screen.getByText(/enter this code in telegram/i)).toBeInTheDocument());
 

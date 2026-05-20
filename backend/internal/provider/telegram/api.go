@@ -209,6 +209,65 @@ func (c *APIClient) DeleteWebhook(ctx context.Context) error {
 	return err
 }
 
+// BotUser is the subset of the getMe response the bot config flow needs.
+// It identifies the bot account behind a token: the numeric id and the
+// @username a user types in Telegram to find it.
+type BotUser struct {
+	ID        int64  `json:"id"`
+	IsBot     bool   `json:"is_bot"`
+	FirstName string `json:"first_name,omitempty"`
+	Username  string `json:"username,omitempty"`
+}
+
+// GetMe calls the Bot API getMe method. It is the canonical way to validate a
+// bot token: a 401 (telegramError, ErrorCode 401) means the token is invalid
+// or revoked. On success it returns the bot's identity.
+func (c *APIClient) GetMe(ctx context.Context) (*BotUser, error) {
+	raw, err := c.callJSON(ctx, "getMe", struct{}{})
+	if err != nil {
+		return nil, err
+	}
+	var u BotUser
+	if err := json.Unmarshal(raw, &u); err != nil {
+		return nil, fmt.Errorf("decode getMe result: %w", err)
+	}
+	return &u, nil
+}
+
+// BotCommand is one entry in the setMyCommands list. Command is the slash
+// command without the leading slash; Description is the short hint Telegram
+// shows in the command menu.
+type BotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// SetMyCommandsParams is the typed payload for setMyCommands.
+type SetMyCommandsParams struct {
+	Commands []BotCommand `json:"commands"`
+}
+
+// SetMyCommands registers the bot's slash-command menu with Telegram. Idempotent
+// — calling it again simply replaces the menu.
+func (c *APIClient) SetMyCommands(ctx context.Context, p SetMyCommandsParams) error {
+	_, err := c.callJSON(ctx, "setMyCommands", p)
+	return err
+}
+
+// AsTelegramError reports whether err is a *telegramError and, if so, returns
+// it. Callers (e.g. botconfig.Connect) use this to distinguish an invalid token
+// (HTTP-level 401/4xx from Telegram) from a network failure.
+func AsTelegramError(err error) (*telegramError, bool) {
+	var te *telegramError
+	if errors.As(err, &te) {
+		return te, true
+	}
+	return nil, false
+}
+
+// ErrorCode returns the Telegram error_code carried by a *telegramError.
+func (e *telegramError) Code() int { return e.ErrorCode }
+
 // IsRateLimited reports whether err is a *rateLimitedError and returns the
 // hinted Retry-After. Helper for the adapter's chunked-send loop.
 func IsRateLimited(err error) (time.Duration, bool) {

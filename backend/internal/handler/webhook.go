@@ -15,7 +15,19 @@ import (
 type WebhookConfig struct {
 	// Provider is the adapter (Telegram, Discord, …) used to verify the
 	// signature and decode the body into InboundMessages.
+	//
+	// Either Provider or ResolveProvider must be set. ResolveProvider takes
+	// precedence: it is the dynamic path (moses-chat-bot-qcq) where the live
+	// adapter can be (re)connected at runtime by a tenant admin without a
+	// redeploy. Provider stays as the static path for tests.
 	Provider provider.Provider
+
+	// ResolveProvider returns the currently active adapter, or nil when no bot
+	// is connected. Called on every request so a connect / disconnect takes
+	// effect immediately. When it returns nil the handler responds 503 — the
+	// webhook route is mounted unconditionally so Telegram does not see a 404
+	// during the window before the first connect.
+	ResolveProvider func() provider.Provider
 
 	// Inbound runs the relay pipeline for each decoded InboundMessage.
 	Inbound *relay.Inbound
@@ -85,6 +97,18 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the active adapter. ResolveProvider is the dynamic path: a
+	// tenant admin may not have connected a bot yet, in which case there is no
+	// adapter and we 503 (the route stays mounted so Telegram never 404s).
+	prov := h.cfg.Provider
+	if h.cfg.ResolveProvider != nil {
+		prov = h.cfg.ResolveProvider()
+	}
+	if prov == nil {
+		http.Error(w, "no telegram bot connected", http.StatusServiceUnavailable)
+		return
+	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, h.cfg.MaxBodyBytes))
 	if err != nil {
 		h.cfg.Logger.Warn("webhook: read body failed", slog.String("err", err.Error()))
@@ -93,7 +117,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	if err := h.cfg.Provider.VerifyWebhookSignature(r.Header, body); err != nil {
+	if err := prov.VerifyWebhookSignature(r.Header, body); err != nil {
 		if errors.Is(err, provider.ErrSignatureInvalid) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -103,14 +127,14 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	messages, err := h.cfg.Provider.HandleWebhook(r.Context(), body, r.Header)
+	messages, err := prov.HandleWebhook(r.Context(), body, r.Header)
 	if err != nil {
 		// We deliberately return 200 even on decode errors so the
 		// provider does not infinitely retry a malformed payload —
 		// Telegram especially will retry forever. Log loudly so the
 		// drift is visible.
 		h.cfg.Logger.Warn("webhook: decode failed",
-			slog.String("provider", h.cfg.Provider.Name()),
+			slog.String("provider", prov.Name()),
 			slog.String("err", err.Error()),
 		)
 		w.WriteHeader(http.StatusOK)

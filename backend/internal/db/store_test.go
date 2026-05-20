@@ -95,11 +95,12 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 }
 
 // resetDB drops everything created by the schema and re-applies it. Cheap-ish
-// (4 tables) and keeps tests isolated without per-test DB creation.
+// (5 tables) and keeps tests isolated without per-test DB creation.
 func resetDB(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
 	const dropSQL = `
+		DROP TABLE IF EXISTS telegram_bot_config CASCADE;
 		DROP TABLE IF EXISTS provider_chat_state CASCADE;
 		DROP TABLE IF EXISTS chat_relay_messages CASCADE;
 		DROP TABLE IF EXISTS chat_relay_links CASCADE;
@@ -129,7 +130,7 @@ func TestApplySchemaIdempotent(t *testing.T) {
 	var count int
 	err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count)
 	require.NoError(t, err)
-	require.Equal(t, 4, count, "expected 4 schema files applied")
+	require.Equal(t, 5, count, "expected 5 schema files applied")
 }
 
 func TestPendingLinkRoundTrip(t *testing.T) {
@@ -368,5 +369,5 @@ func TestApplySchemaTwice(t *testing.T) {
 
 	var count int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count))
-	require.Equal(t, 4, count)
+	require.Equal(t, 5, count)
 }

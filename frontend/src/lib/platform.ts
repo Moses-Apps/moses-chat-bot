@@ -76,5 +76,51 @@ export async function revokeMcpKey(keyId: string): Promise<void> {
   await platform.delete(`/api-keys/${encodeURIComponent(keyId)}`);
 }
 
+// ---------------------------------------------------------------------------
+// Identity — used to gate the admin "Connect Telegram" wizard.
+//
+// The platform mounts auth routes at /auth/* (NOT under /api/v1), so this call
+// targets the iframe origin root, not the platform axios base. The bot does
+// not invent a local role model: tenant-admin status comes straight from the
+// /auth/me tenantMemberships role string.
+// ---------------------------------------------------------------------------
+
+const TENANT_ADMIN_ROLE = 'TenantAdmin';
+
+interface AuthMeResponse {
+  user?: {
+    id?: string;
+    isGlobalAdmin?: boolean;
+    tenantMemberships?: { tenantId?: string; role?: string }[];
+  };
+  // Some platform versions return the user fields at the top level.
+  id?: string;
+  isGlobalAdmin?: boolean;
+  tenantMemberships?: { tenantId?: string; role?: string }[];
+}
+
+/** The current viewer's identity, reduced to what the bot frontend needs. */
+export interface Viewer {
+  /** True when the viewer may connect / disconnect the tenant's Telegram bot. */
+  isTenantAdmin: boolean;
+}
+
+/**
+ * Fetch the current viewer and reduce it to admin status. A global admin or a
+ * user holding the TenantAdmin role in any membership is treated as an admin
+ * for the wizard gate.
+ */
+export async function getViewer(): Promise<Viewer> {
+  const { data } = await axios.get<AuthMeResponse>('/auth/me', {
+    withCredentials: true,
+  });
+  const u = data.user ?? data;
+  const memberships = u.tenantMemberships ?? [];
+  const isTenantAdmin =
+    Boolean(u.isGlobalAdmin) ||
+    memberships.some((m) => m.role === TENANT_ADMIN_ROLE);
+  return { isTenantAdmin };
+}
+
 // Exported for testing.
 export const _internal = { platform };

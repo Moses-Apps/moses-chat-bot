@@ -558,3 +558,104 @@ func (s *Store) ListWithActiveAutopilot(ctx context.Context) ([]ProviderChatStat
 	defer rows.Close()
 	return pgx.CollectRows(rows, pgx.RowToStructByName[ProviderChatState])
 }
+
+// ============================================================================
+// telegram_bot_config
+// ============================================================================
+
+// GetBotConfig returns the Telegram bot configuration for tenantID. Returns
+// pgx.ErrNoRows when the tenant has no bot connected (callers collapse this to
+// "not configured" rather than an error).
+func (s *Store) GetBotConfig(ctx context.Context, tenantID uuid.UUID) (*TelegramBotConfig, error) {
+	if err := requireTenant(tenantID); err != nil {
+		return nil, err
+	}
+	const q = `
+		SELECT tenant_id, encrypted_token, encryption_key_id, bot_id, bot_username,
+		       webhook_secret, connected_by_user_id, connected_at, updated_at
+		FROM telegram_bot_config
+		WHERE tenant_id = $1
+	`
+	rows, err := s.pool.Query(ctx, q, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cfg, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[TelegramBotConfig])
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+// ListBotConfigs returns every tenant's Telegram bot configuration. Used once
+// at startup to register the dynamic adapter(s) — there is no per-request
+// caller, so it is intentionally not tenant-scoped.
+func (s *Store) ListBotConfigs(ctx context.Context) ([]TelegramBotConfig, error) {
+	const q = `
+		SELECT tenant_id, encrypted_token, encryption_key_id, bot_id, bot_username,
+		       webhook_secret, connected_by_user_id, connected_at, updated_at
+		FROM telegram_bot_config
+		ORDER BY connected_at ASC
+	`
+	rows, err := s.pool.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return pgx.CollectRows(rows, pgx.RowToStructByName[TelegramBotConfig])
+}
+
+// UpsertBotConfig inserts or replaces the Telegram bot configuration for
+// tenantID. connected_at is preserved across re-connects (only set on first
+// insert); updated_at is bumped on every call.
+func (s *Store) UpsertBotConfig(
+	ctx context.Context,
+	tenantID uuid.UUID,
+	encryptedToken []byte,
+	encryptionKeyID string,
+	botID *int64,
+	botUsername *string,
+	webhookSecret string,
+	connectedByUserID uuid.UUID,
+) (*TelegramBotConfig, error) {
+	if err := requireTenant(tenantID); err != nil {
+		return nil, err
+	}
+	const q = `
+		INSERT INTO telegram_bot_config
+			(tenant_id, encrypted_token, encryption_key_id, bot_id, bot_username,
+			 webhook_secret, connected_by_user_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (tenant_id) DO UPDATE SET
+			encrypted_token      = EXCLUDED.encrypted_token,
+			encryption_key_id    = EXCLUDED.encryption_key_id,
+			bot_id               = EXCLUDED.bot_id,
+			bot_username         = EXCLUDED.bot_username,
+			webhook_secret       = EXCLUDED.webhook_secret,
+			connected_by_user_id = EXCLUDED.connected_by_user_id,
+			updated_at           = NOW()
+		RETURNING tenant_id, encrypted_token, encryption_key_id, bot_id, bot_username,
+		          webhook_secret, connected_by_user_id, connected_at, updated_at
+	`
+	rows, err := s.pool.Query(ctx, q, tenantID, encryptedToken, encryptionKeyID, botID, botUsername, webhookSecret, connectedByUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cfg, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[TelegramBotConfig])
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+// DeleteBotConfig removes the Telegram bot configuration for tenantID. A
+// no-op (no error) when the tenant has no bot connected.
+func (s *Store) DeleteBotConfig(ctx context.Context, tenantID uuid.UUID) error {
+	if err := requireTenant(tenantID); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM telegram_bot_config WHERE tenant_id = $1`, tenantID)
+	return err
+}

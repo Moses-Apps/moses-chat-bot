@@ -31,7 +31,19 @@ const (
 	UserIDKey   ContextKey = "moses_user_id"
 	TenantIDKey ContextKey = "tenant_id"
 	BearerKey   ContextKey = "bearer_token"
+	// RoleKey holds the user's role string in the resolved tenant (from the
+	// platform /auth/me membership). Empty when the user is a global admin
+	// resolving a tenant they are not an explicit member of.
+	RoleKey ContextKey = "tenant_role"
+	// GlobalAdminKey holds a bool: whether the user is a Moses global admin.
+	GlobalAdminKey ContextKey = "is_global_admin"
 )
+
+// tenantAdminRole is the platform RoleName that grants tenant-admin powers.
+// Mirrors moses-platform-prep types.RoleTenantAdmin. The bot does NOT keep a
+// local role model — this is the single string it matches against the
+// /auth/me membership role.
+const tenantAdminRole = "TenantAdmin"
 
 // AuthValidator is the minimal interface RequireUser needs from the
 // mosesclient. Decoupling allows tests to inject a fake without standing
@@ -84,17 +96,20 @@ func RequireUser(validator AuthValidator) func(http.Handler) http.Handler {
 			}
 
 			resolvedTenant := tenantID
+			var resolvedRole string
 			if resolvedTenant == uuid.Nil {
 				if len(me.TenantMemberships) == 0 {
 					writeJSONError(w, http.StatusForbidden, "no tenant memberships")
 					return
 				}
 				resolvedTenant = me.TenantMemberships[0].TenantID
+				resolvedRole = me.TenantMemberships[0].Role
 			} else {
 				ok := false
 				for _, m := range me.TenantMemberships {
 					if m.TenantID == resolvedTenant {
 						ok = true
+						resolvedRole = m.Role
 						break
 					}
 				}
@@ -107,9 +122,48 @@ func RequireUser(validator AuthValidator) func(http.Handler) http.Handler {
 			ctx := context.WithValue(r.Context(), UserIDKey, userID)
 			ctx = context.WithValue(ctx, TenantIDKey, resolvedTenant)
 			ctx = context.WithValue(ctx, BearerKey, bearer)
+			ctx = context.WithValue(ctx, RoleKey, resolvedRole)
+			ctx = context.WithValue(ctx, GlobalAdminKey, me.IsGlobalAdmin)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// RequireTenantAdmin gates a handler to tenant administrators. It MUST be
+// chained AFTER RequireUser (which resolves and stamps the role / global-admin
+// flags). A Moses global admin always passes; otherwise the user's role in the
+// resolved tenant must be TenantAdmin.
+//
+// This deliberately reuses the platform's role model rather than inventing a
+// local one: the role string comes straight from /auth/me's tenantMemberships.
+func RequireTenantAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		if UserID(ctx) == uuid.Nil {
+			// RequireUser did not run / rejected — fail closed.
+			writeJSONError(w, http.StatusUnauthorized, "unauthenticated")
+			return
+		}
+		if IsGlobalAdmin(ctx) || Role(ctx) == tenantAdminRole {
+			next.ServeHTTP(w, r)
+			return
+		}
+		writeJSONError(w, http.StatusForbidden, "tenant admin role required")
+	})
+}
+
+// Role returns the user's role string in the resolved tenant, as stamped by
+// RequireUser. Empty when unset.
+func Role(ctx context.Context) string {
+	v, _ := ctx.Value(RoleKey).(string)
+	return v
+}
+
+// IsGlobalAdmin reports whether RequireUser flagged the caller as a Moses
+// global admin.
+func IsGlobalAdmin(ctx context.Context) bool {
+	v, _ := ctx.Value(GlobalAdminKey).(bool)
+	return v
 }
 
 // extractBearer pulls a bearer token from Authorization or the

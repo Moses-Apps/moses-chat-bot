@@ -1,4 +1,13 @@
-// LinkNew — 4-step flow:
+// LinkNew — honest, bot-aware linking flow (moses-chat-bot-qcq).
+//
+// Before any code is minted the page checks GET /provider/telegram/info:
+//   - configured=false → an honest "no bot connected yet" card. If the viewer
+//     is a tenant admin it links to the in-app Connect wizard; otherwise it
+//     tells them to ask their admin. NO fabricated @moses_<tenant>_bot handle.
+//   - configured=true  → the original mint → code → poll flow, and the claim
+//     instructions show the REAL @username returned by the backend.
+//
+// Steps once a bot is connected:
 //   1. pick provider (Telegram only enabled in v1)
 //   2. generate code → mint platform key → POST /links/codes
 //   3. show code + countdown + poll until completion or expiry
@@ -7,27 +16,34 @@
 // Security:
 //   - The plaintext MCP key returned by createMcpKey() lives ONLY in this
 //     component's closure (a useRef). It's wiped the moment createLinkCode()
-//     resolves (step 2.4 in the brief). It never enters Zustand, never enters
-//     localStorage, never appears in JSX.
+//     resolves. It never enters Zustand, never enters localStorage, never
+//     appears in JSX.
 //   - The platform key UUID (keyId) is retained so we can revoke on expiry /
 //     cancel — that one is non-sensitive.
 
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link as RouterLink, useNavigate } from 'react-router-dom';
 
 import BentoCard from '@/components/layout/BentoCard';
 import ProviderPicker from '@/components/links/ProviderPicker';
 import CodeDisplay from '@/components/links/CodeDisplay';
 import CountdownTimer from '@/components/links/CountdownTimer';
-import { createMcpKey, revokeMcpKey } from '@/lib/platform';
-import { createLinkCode, pollLinkCode } from '@/lib/bot-api';
+import { createMcpKey, revokeMcpKey, getViewer } from '@/lib/platform';
+import { createLinkCode, pollLinkCode, getTelegramInfo } from '@/lib/bot-api';
 import type { ApiError } from '@/lib/api';
 
 const KEY_TTL_DAYS = 90;
 const CODE_TTL_SECONDS = 60;
 const POLL_INTERVAL_MS = 2000;
 
-type Step = 'pick' | 'generating' | 'code' | 'expired' | 'success';
+type Step =
+  | 'loading'
+  | 'not-connected'
+  | 'pick'
+  | 'generating'
+  | 'code'
+  | 'expired'
+  | 'success';
 
 interface CodeState {
   code: string;
@@ -55,19 +71,49 @@ function plus90DaysIso(): string {
 export default function LinkNew(): ReactElement {
   const navigate = useNavigate();
   const [provider, setProvider] = useState<string>('telegram');
-  const [step, setStep] = useState<Step>('pick');
+  const [step, setStep] = useState<Step>('loading');
   const [codeState, setCodeState] = useState<CodeState | null>(null);
   const [linkId, setLinkId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // The plaintext MCP key briefly held between createMcpKey() and
-  // createLinkCode(). Stored in a ref so it never enters React state (and
-  // therefore never appears in any test-rendered DOM).
-  const plaintextKeyRef = useRef<string | null>(null);
+  // The real bot @username (set once the info call resolves configured=true).
+  const [botUsername, setBotUsername] = useState<string>('');
+  // Whether the viewer may reach the admin Connect wizard.
+  const [viewerIsAdmin, setViewerIsAdmin] = useState<boolean>(false);
 
-  // Track whether we have effectively "consumed" the key (handed it off) so
-  // unmount cleanup doesn't try to revoke a key that's now tied to a link.
+  // The plaintext MCP key briefly held between createMcpKey() and
+  // createLinkCode(). Stored in a ref so it never enters React state.
+  const plaintextKeyRef = useRef<string | null>(null);
   const keyConsumedRef = useRef(false);
+
+  // On mount: fetch the tenant's bot status. configured drives the first step.
+  const loadInfo = useCallback(async () => {
+    setStep('loading');
+    setError(null);
+    try {
+      const info = await getTelegramInfo();
+      if (info.configured) {
+        setBotUsername(info.username ?? '');
+        setStep('pick');
+        return;
+      }
+      // Not connected — find out if the viewer can fix it themselves.
+      try {
+        const viewer = await getViewer();
+        setViewerIsAdmin(viewer.isTenantAdmin);
+      } catch {
+        setViewerIsAdmin(false);
+      }
+      setStep('not-connected');
+    } catch (err) {
+      setError(toApiError(err).message || 'Could not load the bot status.');
+      setStep('not-connected');
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadInfo();
+  }, [loadInfo]);
 
   const cancelGeneration = useCallback(async () => {
     plaintextKeyRef.current = null;
@@ -106,16 +152,12 @@ export default function LinkNew(): ReactElement {
       });
 
       // The plaintext key has done its job: the bot has stored it encrypted.
-      // Wipe it from the closure right now.
       plaintextKeyRef.current = null;
 
       setCodeState({ code: codeResult.code, expiresAt: codeResult.expiresAt, keyId });
       setStep('code');
     } catch (err) {
       const apiErr = toApiError(err);
-      // If we already minted a key but didn't get a code, the user has an
-      // orphan key on the platform side — revoke it (best-effort) so we don't
-      // litter the user's key list.
       plaintextKeyRef.current = null;
       if (keyId) {
         try {
@@ -139,18 +181,15 @@ export default function LinkNew(): ReactElement {
         const res = await pollLinkCode(codeState!.code);
         if (cancelled) return;
         if (res.status === 'completed' && res.linkId) {
-          // Mark the key as consumed so unmount cleanup doesn't revoke it.
           keyConsumedRef.current = true;
           setLinkId(res.linkId);
           setStep('success');
           return;
         }
-        // 'pending' → keep polling.
       } catch (err) {
         if (cancelled) return;
         const apiErr = toApiError(err);
         if (apiErr.status === 410) {
-          // Server says the code is expired — revoke the platform key.
           if (codeState && !keyConsumedRef.current) {
             try {
               await revokeMcpKey(codeState.keyId);
@@ -162,15 +201,11 @@ export default function LinkNew(): ReactElement {
           setStep('expired');
           return;
         }
-        // 404 → keep polling until countdown hits zero.
         if (apiErr.status === 404) return;
-        // Anything else → surface the error but keep the code visible so the
-        // user can still claim it from Telegram.
         setError(apiErr.message);
       }
     }
 
-    // Fire immediately so the user doesn't wait 2s for the first poll.
     void tick();
     const id = window.setInterval(() => void tick(), POLL_INTERVAL_MS);
     return () => {
@@ -186,15 +221,12 @@ export default function LinkNew(): ReactElement {
     return () => window.clearTimeout(id);
   }, [step, linkId, navigate]);
 
-  // On unmount: if we still hold an unconsumed key, revoke it so we don't
-  // leak orphan keys when the user navigates away.
+  // On unmount: revoke an unconsumed key so we don't leak orphan keys.
   useEffect(() => {
     return () => {
       const keyId = codeState?.keyId;
       plaintextKeyRef.current = null;
       if (keyId && !keyConsumedRef.current) {
-        // Best-effort: wrap so a non-promise return (e.g. from a test mock)
-        // doesn't blow up the cleanup phase.
         try {
           const p = revokeMcpKey(keyId) as Promise<void> | undefined;
           p?.catch?.(() => undefined);
@@ -218,8 +250,64 @@ export default function LinkNew(): ReactElement {
     setStep('expired');
   }, [codeState]);
 
+  // The bot handle shown in claim instructions — always the REAL @username.
+  const botHandle = botUsername ? `@${botUsername}` : 'your tenant Telegram bot';
+
   return (
     <div className="grid grid-cols-1 gap-4">
+      {step === 'loading' && (
+        <BentoCard title="Link a chat">
+          <p className="text-sm text-moses-text-muted" aria-live="polite">
+            Checking your tenant's Telegram bot…
+          </p>
+        </BentoCard>
+      )}
+
+      {step === 'not-connected' && (
+        <BentoCard
+          title="No Telegram bot connected yet"
+          subtitle="Linking is unavailable until a bot is set up"
+        >
+          <div className="flex flex-col gap-4">
+            <p className="text-sm text-moses-text-muted">
+              Your tenant admin has not connected a Telegram bot yet. A Telegram
+              bot has to be created once by an administrator before anyone in
+              the workspace can link their chat.
+            </p>
+            {error && (
+              <p role="alert" className="text-sm text-moses-status-error">
+                {error}
+              </p>
+            )}
+            {viewerIsAdmin ? (
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <RouterLink
+                  to="/settings/telegram"
+                  className="inline-flex min-h-[44px] items-center justify-center rounded-bento bg-moses-accent px-4 text-sm font-semibold text-white hover:bg-moses-accent-hover focus:outline-none focus:ring-2 focus:ring-moses-accent/40"
+                >
+                  Connect Telegram
+                </RouterLink>
+                <span className="text-sm text-moses-text-subtle">
+                  You're a tenant admin — you can set this up now.
+                </span>
+              </div>
+            ) : (
+              <p className="text-sm text-moses-text-subtle">
+                Ask a tenant administrator to connect a Telegram bot from the
+                workspace settings.
+              </p>
+            )}
+            <button
+              type="button"
+              onClick={() => void loadInfo()}
+              className="self-start min-h-[44px] rounded-bento border border-moses-border bg-moses-surface-raised px-4 text-sm font-medium text-moses-text hover:bg-moses-surface-sunken focus:outline-none focus:ring-2 focus:ring-moses-accent/40 dark:border-moses-border-dark dark:bg-moses-surface-dark-raised dark:text-moses-text-inverse"
+            >
+              Re-check
+            </button>
+          </div>
+        </BentoCard>
+      )}
+
       {step === 'pick' && (
         <BentoCard title="Link a chat" subtitle="Step 1 of 3 — pick a provider">
           <ProviderPicker value={provider} onChange={setProvider} />
@@ -262,7 +350,7 @@ export default function LinkNew(): ReactElement {
               <ol className="mt-2 list-decimal space-y-1 pl-5 text-moses-text-muted">
                 <li>Open Telegram on any device.</li>
                 <li>
-                  Find <span className="font-mono">@moses_&lt;tenant&gt;_bot</span>.
+                  Find <span className="font-mono">{botHandle}</span>.
                 </li>
                 <li>
                   Send <span className="font-mono">/link {codeState.code}</span>.

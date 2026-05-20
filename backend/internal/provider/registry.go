@@ -34,6 +34,31 @@ func (r *Registry) Register(p Provider) error {
 	return nil
 }
 
+// Replace installs p under its Name(), overwriting any existing provider with
+// that name. Unlike Register it never errors on a duplicate — it is the
+// runtime-reconfiguration path used when a tenant admin (re-)connects a bot
+// through the in-app wizard, which must swap the live adapter without a
+// process restart.
+func (r *Registry) Replace(p Provider) error {
+	if p == nil {
+		return ErrUnknownProvider
+	}
+	name := p.Name()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.providers[name] = p
+	return nil
+}
+
+// Remove drops the provider registered under name, if any. Used by the
+// Disconnect path so outbound sends fail cleanly ("no provider") once a tenant
+// admin disconnects their bot.
+func (r *Registry) Remove(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.providers, name)
+}
+
 func (r *Registry) Get(name string) (Provider, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

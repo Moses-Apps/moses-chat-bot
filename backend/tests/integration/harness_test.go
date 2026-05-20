@@ -125,12 +125,13 @@ func setupIntegrationDB(t *testing.T) *pgxpool.Pool {
 	return intgPool
 }
 
-// resetIntegrationDB drops and re-applies the schema. Cheap (4 tables) and
+// resetIntegrationDB drops and re-applies the schema. Cheap (5 tables) and
 // guarantees per-test isolation when called from each test's setup.
 func resetIntegrationDB(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
 	const dropSQL = `
+		DROP TABLE IF EXISTS telegram_bot_config CASCADE;
 		DROP TABLE IF EXISTS provider_chat_state CASCADE;
 		DROP TABLE IF EXISTS chat_relay_messages CASCADE;
 		DROP TABLE IF EXISTS chat_relay_links CASCADE;

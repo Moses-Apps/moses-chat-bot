@@ -27,8 +27,8 @@ import (
 	"moses-chat-bot/backend/internal/handler/middleware"
 	"moses-chat-bot/backend/internal/mosesclient"
 	"moses-chat-bot/backend/internal/provider"
-	"moses-chat-bot/backend/internal/provider/telegram"
 	"moses-chat-bot/backend/internal/service/autopilot"
+	"moses-chat-bot/backend/internal/service/botconfig"
 	"moses-chat-bot/backend/internal/service/crypto"
 	"moses-chat-bot/backend/internal/service/linker"
 	"moses-chat-bot/backend/internal/service/relay"
@@ -88,31 +88,21 @@ func main() {
 	sender := relay.NewSender(store, providerRegistry, relay.SenderOpts{})
 	go sender.Bucket().Run(ctx)
 
-	// Telegram adapter registration. Skipped when the bot token is unset
-	// (staging/CI without a real bot) — the registry still serves push
-	// endpoints with a "no providers" response per link.
-	var tgAdapter *telegram.Adapter
-	if tgToken := os.Getenv("TELEGRAM_BOT_TOKEN"); tgToken != "" {
-		tg, err := telegram.New(telegram.Config{
-			BotToken:      tgToken,
-			WebhookSecret: os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
-			PublicURL:     os.Getenv("TELEGRAM_PUBLIC_URL"),
-			AutoSetup:     os.Getenv("BOT_WEBHOOK_AUTO_SETUP") == "true",
-		})
-		if err != nil {
-			log.Fatalf("telegram adapter: %v", err)
-		}
-		if err := providerRegistry.Register(tg); err != nil {
-			log.Fatalf("register telegram: %v", err)
-		}
-		tgAdapter = tg
-		if os.Getenv("BOT_WEBHOOK_AUTO_SETUP") == "true" {
-			if err := tg.SetupWebhook(ctx, os.Getenv("TELEGRAM_PUBLIC_URL")); err != nil {
-				logger.Warn("telegram setup webhook failed", slog.String("err", err.Error()))
-			}
-		}
-	} else {
-		logger.Warn("TELEGRAM_BOT_TOKEN unset; telegram adapter not registered")
+	// Telegram bot configuration (moses-chat-bot-qcq). The bot token is now
+	// stored encrypted per-tenant in telegram_bot_config and set via the
+	// in-app admin "Connect Telegram" wizard. LoadAtStartup hydrates the live
+	// adapter from that table; the TELEGRAM_BOT_TOKEN env var remains a
+	// bootstrap/legacy fallback used only when no DB row exists.
+	//
+	// The webhook route is mounted unconditionally below — when no bot is
+	// connected the handler returns 503 rather than 404, so Telegram never
+	// sees a missing endpoint during the pre-connect window.
+	botConfigSvc := botconfig.New(store, envelope, providerRegistry, logger)
+	if _, err := botConfigSvc.LoadAtStartup(ctx, os.Getenv("TELEGRAM_BOT_TOKEN"), os.Getenv("TELEGRAM_WEBHOOK_SECRET")); err != nil {
+		log.Fatalf("telegram bot config load: %v", err)
+	}
+	if botConfigSvc.ActiveAdapter() == nil {
+		logger.Warn("no telegram bot connected; a tenant admin can connect one via the in-app wizard")
 	}
 
 	// WS pool for the inbound relay: one persistent socket per linked user
@@ -154,23 +144,44 @@ func main() {
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/api/openapi.json", handler.OpenAPIHandler)
 
-	// Webhook endpoint — publicly accessible (no RequireUser). The
-	// provider's VerifyWebhookSignature is the authenticator.
-	if tgAdapter != nil {
-		webhook := handler.NewWebhookHandler(handler.WebhookConfig{
-			Provider:          tgAdapter,
-			Inbound:           inbound,
-			MaxConcurrent:     32,
-			Logger:            logger,
-			BackgroundContext: ctx,
-		})
-		mux.Handle("/api/v1/providers/telegram/webhook", webhook)
-	}
+	// Webhook endpoint — publicly accessible (no RequireUser). The active
+	// adapter's VerifyWebhookSignature is the authenticator; ResolveProvider
+	// fetches whatever bot the tenant admin has connected (or nil → 503). The
+	// route is mounted unconditionally so it survives a connect/disconnect
+	// without a redeploy.
+	webhook := handler.NewWebhookHandler(handler.WebhookConfig{
+		ResolveProvider: func() provider.Provider {
+			a := botConfigSvc.ActiveAdapter()
+			if a == nil {
+				return nil
+			}
+			return a
+		},
+		Inbound:           inbound,
+		MaxConcurrent:     32,
+		Logger:            logger,
+		BackgroundContext: ctx,
+	})
+	mux.Handle("/api/v1/providers/telegram/webhook", webhook)
 
 	protected := http.NewServeMux()
 	handler.NewLinks(link, store).Register(protected)
 	mux.Handle("/api/v1/links/", middleware.RequireUser(mosesClient)(protected))
 	mux.Handle("/api/v1/links", middleware.RequireUser(mosesClient)(protected))
+
+	// Telegram bot configuration (moses-chat-bot-qcq): GET /info is a tenant
+	// read for any member; POST/DELETE /connect are tenant-admin gated.
+	// RequireUser stamps the role; RequireTenantAdmin enforces it. All three
+	// routes live on a single mux (the handler registers them); the outer mux
+	// dispatches each method-scoped pattern through the right middleware chain.
+	tgConfigHandler := handler.NewTelegramConfig(botConfigSvc, os.Getenv("MOSES_BASE_PATH"))
+	tgConfigMux := http.NewServeMux()
+	tgConfigHandler.Register(tgConfigMux)
+	mux.Handle("GET /api/v1/provider/telegram/info",
+		middleware.RequireUser(mosesClient)(tgConfigMux))
+	tgAdminGated := middleware.RequireUser(mosesClient)(middleware.RequireTenantAdmin(tgConfigMux))
+	mux.Handle("POST /api/v1/provider/telegram/connect", tgAdminGated)
+	mux.Handle("DELETE /api/v1/provider/telegram/connect", tgAdminGated)
 
 	// Workspace-tool surface (T-PUSH-1 + CHAT-y3u bearer gate): the ingress
 	// routes /api/ to the backend, so these endpoints are externally reachable.

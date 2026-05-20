@@ -93,6 +93,7 @@ func resetDB(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
 	const dropSQL = `
+		DROP TABLE IF EXISTS telegram_bot_config CASCADE;
 		DROP TABLE IF EXISTS provider_chat_state CASCADE;
 		DROP TABLE IF EXISTS chat_relay_messages CASCADE;
 		DROP TABLE IF EXISTS chat_relay_links CASCADE;

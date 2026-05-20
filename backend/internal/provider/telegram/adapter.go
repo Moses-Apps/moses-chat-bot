@@ -99,6 +99,19 @@ func New(cfg Config) (*Adapter, error) {
 // Name returns the stable provider identifier.
 func (a *Adapter) Name() string { return ProviderName }
 
+// API exposes the underlying typed Bot API client. The botconfig service uses
+// it to validate a token (getMe) and register the webhook + command menu when
+// a tenant admin connects a bot through the in-app wizard.
+func (a *Adapter) API() *APIClient { return a.api }
+
+// WebhookSecret returns the secret_token this adapter expects Telegram to echo
+// in the X-Telegram-Bot-Api-Secret-Token header.
+func (a *Adapter) WebhookSecret() string { return a.webhookSecret }
+
+// WebhookPath returns the route suffix the webhook is mounted at, so callers
+// can derive the full setWebhook URL without importing the constant.
+func WebhookPath() string { return webhookPath }
+
 // VerifyWebhookSignature checks the X-Telegram-Bot-Api-Secret-Token header
 // against the configured webhook secret in constant time. The body is
 // unused but accepted to match the interface contract.
