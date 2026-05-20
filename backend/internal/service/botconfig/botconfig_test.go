@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -142,13 +143,19 @@ func newTestEnvelope(t *testing.T) *crypto.Envelope {
 }
 
 // stubTelegram stands up an httptest server impersonating api.telegram.org.
-// getMeOK toggles whether getMe returns a valid bot or a 401.
+// getMeOK toggles whether getMe returns a valid bot or a 401. All counters are
+// accessed via sync/atomic so a running poll-loop goroutine cannot race the
+// test assertions.
 type stubTelegram struct {
-	srv         *httptest.Server
-	getMeOK     bool
-	setWebhook  int32
-	myCommands  int32
-	delWebhook  int32
+	srv     *httptest.Server
+	getMeOK bool
+
+	setWebhookN atomic.Int32
+	myCommandsN atomic.Int32
+	delWebhookN atomic.Int32
+	getUpdatesN atomic.Int32
+
+	mu          sync.Mutex
 	lastSecret  string
 	lastWebhook string
 }
@@ -167,28 +174,46 @@ func newStubTelegram(t *testing.T, getMeOK bool) *stubTelegram {
 			}
 			fmt.Fprint(w, `{"ok":true,"result":{"id":555,"is_bot":true,"username":"moses_test_bot"}}`)
 		case strings.HasSuffix(r.URL.Path, "/setWebhook"):
-			s.setWebhook++
+			s.setWebhookN.Add(1)
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			s.mu.Lock()
 			if v, ok := body["secret_token"].(string); ok {
 				s.lastSecret = v
 			}
 			if v, ok := body["url"].(string); ok {
 				s.lastWebhook = v
 			}
+			s.mu.Unlock()
 			fmt.Fprint(w, `{"ok":true,"result":true}`)
 		case strings.HasSuffix(r.URL.Path, "/setMyCommands"):
-			s.myCommands++
+			s.myCommandsN.Add(1)
 			fmt.Fprint(w, `{"ok":true,"result":true}`)
 		case strings.HasSuffix(r.URL.Path, "/deleteWebhook"):
-			s.delWebhook++
+			s.delWebhookN.Add(1)
 			fmt.Fprint(w, `{"ok":true,"result":true}`)
+		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
+			s.getUpdatesN.Add(1)
+			// Empty batch keeps the poll loop idle without delivering work.
+			fmt.Fprint(w, `{"ok":true,"result":[]}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	t.Cleanup(s.srv.Close)
 	return s
+}
+
+func (s *stubTelegram) webhookTarget() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastWebhook
+}
+
+func (s *stubTelegram) webhookSecret() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastSecret
 }
 
 // newService builds a botconfig.Service whose adapters point at the stub.
@@ -227,12 +252,11 @@ func TestConnect_ValidToken_EncryptsAtRest(t *testing.T) {
 	require.True(t, info.Configured)
 	require.Equal(t, "moses_test_bot", info.Username)
 
-	// Webhook + commands registered with Telegram.
-	require.Equal(t, int32(1), stub.setWebhook)
-	require.Equal(t, int32(1), stub.myCommands)
-	require.Equal(t,
-		"https://moses.example/apps/t/moses-chat-bot"+telegram.WebhookPath(),
-		stub.lastWebhook)
+	// Default (long-polling) mode: Connect drops any webhook and does NOT
+	// register one — getUpdates and a webhook are mutually exclusive.
+	require.Equal(t, int32(1), stub.delWebhookN.Load(), "default mode must deleteWebhook")
+	require.Equal(t, int32(0), stub.setWebhookN.Load(), "default mode must NOT call setWebhook")
+	require.Equal(t, int32(1), stub.myCommandsN.Load())
 
 	// Token is stored ENCRYPTED — never plaintext.
 	store := db.NewStore(pool)
@@ -246,16 +270,75 @@ func TestConnect_ValidToken_EncryptsAtRest(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, token, string(plain))
 
-	// The webhook secret persisted is the one Telegram was told to echo.
-	require.Equal(t, cfg.WebhookSecret, stub.lastSecret)
-
-	// The live adapter is registered and verifies against the stored secret.
+	// The live adapter is registered.
 	adapter := svc.ActiveAdapter()
 	require.NotNil(t, adapter)
-	require.Equal(t, cfg.WebhookSecret, adapter.WebhookSecret())
 	_, registered := reg.Get(telegram.ProviderName)
 	require.True(t, registered, "adapter must be in the shared registry for the relay sender")
 }
+
+// TestConnect_WebhookMode_OptIn proves that with BOT_WEBHOOK_PUBLIC_URL set,
+// Connect registers a webhook (not a poll loop): setWebhook is called with the
+// configured base URL + path, and the secret Telegram echoes is the stored one.
+func TestConnect_WebhookMode_OptIn(t *testing.T) {
+	pool := setupTestDB(t)
+	resetDB(t, pool)
+	env := newTestEnvelope(t)
+	stub := newStubTelegram(t, true)
+	svc, _ := newService(t, pool, env, stub)
+	svc.SetWebhookPublicURL("https://bot.example.com/apps/t/moses-chat-bot")
+	ctx := context.Background()
+
+	tenant := uuid.New()
+	_, err := svc.Connect(ctx, tenant, uuid.New(), "tok", "https://ignored.example")
+	require.NoError(t, err)
+
+	require.Equal(t, int32(1), stub.setWebhookN.Load(), "webhook mode must call setWebhook")
+	require.Equal(t, int32(0), stub.delWebhookN.Load(), "webhook mode must NOT call deleteWebhook")
+	require.Equal(t,
+		"https://bot.example.com/apps/t/moses-chat-bot"+telegram.WebhookPath(),
+		stub.webhookTarget())
+
+	store := db.NewStore(pool)
+	cfg, err := store.GetBotConfig(ctx, tenant)
+	require.NoError(t, err)
+	require.Equal(t, cfg.WebhookSecret, stub.webhookSecret())
+
+	adapter := svc.ActiveAdapter()
+	require.NotNil(t, adapter)
+	require.Equal(t, cfg.WebhookSecret, adapter.WebhookSecret())
+}
+
+// TestConnect_DefaultMode_StartsPollLoop proves that in the default mode a
+// wired dispatcher receives traffic via a poll loop Connect launched — i.e.
+// getUpdates is being called against Telegram with no webhook in play.
+func TestConnect_DefaultMode_StartsPollLoop(t *testing.T) {
+	pool := setupTestDB(t)
+	resetDB(t, pool)
+	env := newTestEnvelope(t)
+	stub := newStubTelegram(t, true)
+	svc, _ := newService(t, pool, env, stub)
+	svc.SetInboundDispatcher(noopDispatcher{})
+	ctx := context.Background()
+
+	tenant := uuid.New()
+	_, err := svc.Connect(ctx, tenant, uuid.New(), "tok", "https://moses.example")
+	require.NoError(t, err)
+
+	// The poll loop runs in a goroutine; wait for it to issue getUpdates.
+	require.Eventually(t, func() bool {
+		return stub.getUpdatesN.Load() >= 1
+	}, 3*time.Second, 20*time.Millisecond, "poll loop must call getUpdates")
+	require.Equal(t, int32(0), stub.setWebhookN.Load(), "long-polling mode never sets a webhook")
+
+	// Disconnect stops the loop cleanly.
+	require.NoError(t, svc.Disconnect(ctx, tenant))
+}
+
+// noopDispatcher is a telegram.InboundDispatcher that swallows every message.
+type noopDispatcher struct{}
+
+func (noopDispatcher) HandleInbound(context.Context, provider.InboundMessage) error { return nil }
 
 func TestConnect_InvalidToken_Rejected(t *testing.T) {
 	pool := setupTestDB(t)
@@ -328,7 +411,7 @@ func TestDisconnect_RemovesConfigAndAdapter(t *testing.T) {
 	require.NotNil(t, svc.ActiveAdapter())
 
 	require.NoError(t, svc.Disconnect(ctx, tenant))
-	require.GreaterOrEqual(t, stub.delWebhook, int32(1), "deleteWebhook must be attempted")
+	require.GreaterOrEqual(t, stub.delWebhookN.Load(), int32(1), "deleteWebhook must be attempted")
 	require.Nil(t, svc.ActiveAdapter())
 	_, registered := reg.Get(telegram.ProviderName)
 	require.False(t, registered, "adapter must be removed from the registry")

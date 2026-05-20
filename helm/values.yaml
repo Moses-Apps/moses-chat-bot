@@ -18,6 +18,11 @@ moses:
 nameOverride: ""
 fullnameOverride: ""
 
+# Keep this at 1. The bot's default inbound mode is Telegram long-polling
+# (getUpdates), which is single-consumer — Telegram hands each update to
+# exactly one poller, so exactly one replica may run per bot token. Scaling
+# out would require opt-in webhook mode (BOT_WEBHOOK_PUBLIC_URL) or a
+# leader-elected single poller (a future bead). See SPEC §11.
 replicaCount: 1
 
 # Image references (v2 format). Keyed by docker.files[].name from

@@ -1,11 +1,14 @@
 // Command server boots the moses-chat-bot HTTP service.
 //
-// As of T-RELAY-1 the inbound relay is wired up: the Telegram adapter
-// registers itself in the provider registry, the webhook endpoint
-// /api/v1/providers/telegram/webhook accepts updates publicly (signature
-// verified via X-Telegram-Bot-Api-Secret-Token), and inbound messages
-// drive the Moses Manager streaming bridge with response chunks
-// aggregated over a per-link WS subscription.
+// Inbound relay: the Telegram adapter registers itself in the provider
+// registry and inbound messages drive the Moses Manager streaming bridge with
+// response chunks aggregated over a per-link WS subscription.
+//
+// Inbound mode (moses-chat-bot-9so): by default the bot LONG-POLLS getUpdates —
+// a purely outbound model that needs no public URL and works behind the Moses
+// per-app auth gate. The webhook endpoint /api/v1/providers/telegram/webhook is
+// still mounted (signature verified via X-Telegram-Bot-Api-Secret-Token) and
+// becomes the active ingress only when BOT_WEBHOOK_PUBLIC_URL is set.
 //
 // Push API + workspace-tool OpenAPI (T-PUSH-1) are already wired below.
 package main
@@ -88,23 +91,6 @@ func main() {
 	sender := relay.NewSender(store, providerRegistry, relay.SenderOpts{})
 	go sender.Bucket().Run(ctx)
 
-	// Telegram bot configuration (moses-chat-bot-qcq). The bot token is now
-	// stored encrypted per-tenant in telegram_bot_config and set via the
-	// in-app admin "Connect Telegram" wizard. LoadAtStartup hydrates the live
-	// adapter from that table; the TELEGRAM_BOT_TOKEN env var remains a
-	// bootstrap/legacy fallback used only when no DB row exists.
-	//
-	// The webhook route is mounted unconditionally below — when no bot is
-	// connected the handler returns 503 rather than 404, so Telegram never
-	// sees a missing endpoint during the pre-connect window.
-	botConfigSvc := botconfig.New(store, envelope, providerRegistry, logger)
-	if _, err := botConfigSvc.LoadAtStartup(ctx, os.Getenv("TELEGRAM_BOT_TOKEN"), os.Getenv("TELEGRAM_WEBHOOK_SECRET")); err != nil {
-		log.Fatalf("telegram bot config load: %v", err)
-	}
-	if botConfigSvc.ActiveAdapter() == nil {
-		logger.Warn("no telegram bot connected; a tenant admin can connect one via the in-app wizard")
-	}
-
 	// WS pool for the inbound relay: one persistent socket per linked user
 	// (the WS handshake URL embeds the user's MCP key, so we cannot share
 	// one connection across users). Idle conns reaped by RunSweeper every
@@ -140,15 +126,49 @@ func main() {
 	inbound.Autopilot = autopilotSvc
 	go autopilotSvc.StartSweeper(ctx, 60*time.Second)
 
+	// Telegram bot configuration (moses-chat-bot-qcq + moses-chat-bot-9so).
+	// The bot token is stored encrypted per-tenant in telegram_bot_config and
+	// set via the in-app admin "Connect Telegram" wizard. LoadAtStartup
+	// hydrates the live adapter from that table; the TELEGRAM_BOT_TOKEN env var
+	// remains a bootstrap/legacy fallback used only when no DB row exists.
+	//
+	// Inbound mode: by default the bot LONG-POLLS getUpdates — a purely
+	// outbound model that works behind the Moses per-app auth gate with no
+	// public URL or tunnel. botconfig owns the poll loop; it feeds the relay's
+	// Inbound.HandleInbound, the exact same path the webhook handler uses, so
+	// the relay stays mode-agnostic and its provider_message_id dedup covers
+	// the at-startup re-fetch (the offset is in-memory only).
+	//
+	// Webhook is the OPT-IN alternative, enabled only when BOT_WEBHOOK_PUBLIC_URL
+	// is set. The webhook route is mounted unconditionally below regardless; in
+	// long-polling mode it simply never receives traffic (Telegram is not told
+	// the URL), and it returns 503 when no bot is connected.
+	//
+	// getUpdates is single-consumer: exactly one poll loop may run per bot
+	// token, which is why the deployment keeps replicas: 1. Scaling out would
+	// require webhook mode or a leader-elected single poller (a future bead).
+	botConfigSvc := botconfig.New(store, envelope, providerRegistry, logger)
+	botConfigSvc.SetInboundDispatcher(inbound)
+	botConfigSvc.SetLoopContext(ctx)
+	botConfigSvc.SetWebhookPublicURL(os.Getenv("BOT_WEBHOOK_PUBLIC_URL"))
+	if _, err := botConfigSvc.LoadAtStartup(ctx, os.Getenv("TELEGRAM_BOT_TOKEN"), os.Getenv("TELEGRAM_WEBHOOK_SECRET")); err != nil {
+		log.Fatalf("telegram bot config load: %v", err)
+	}
+	if botConfigSvc.ActiveAdapter() == nil {
+		logger.Warn("no telegram bot connected; a tenant admin can connect one via the in-app wizard")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/api/openapi.json", handler.OpenAPIHandler)
 
-	// Webhook endpoint — publicly accessible (no RequireUser). The active
-	// adapter's VerifyWebhookSignature is the authenticator; ResolveProvider
-	// fetches whatever bot the tenant admin has connected (or nil → 503). The
-	// route is mounted unconditionally so it survives a connect/disconnect
-	// without a redeploy.
+	// Webhook endpoint — the OPT-IN inbound path (active only when
+	// BOT_WEBHOOK_PUBLIC_URL is set; otherwise the bot long-polls and this
+	// route never receives traffic). Publicly accessible (no RequireUser): the
+	// active adapter's VerifyWebhookSignature is the authenticator;
+	// ResolveProvider fetches whatever bot the tenant admin has connected (or
+	// nil → 503). The route is mounted unconditionally so it survives a
+	// connect/disconnect — and a mode switch — without a redeploy.
 	webhook := handler.NewWebhookHandler(handler.WebhookConfig{
 		ResolveProvider: func() provider.Provider {
 			a := botConfigSvc.ActiveAdapter()

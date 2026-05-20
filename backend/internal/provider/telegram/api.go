@@ -209,6 +209,35 @@ func (c *APIClient) DeleteWebhook(ctx context.Context) error {
 	return err
 }
 
+// GetUpdatesParams is the typed payload for getUpdates (long-polling).
+//
+// Offset is max(update_id of the previous batch)+1; passing it acknowledges
+// every update below it, so Telegram never re-sends them. Timeout is the
+// long-poll hold time in seconds — the call blocks server-side until an
+// update arrives or Timeout elapses, which keeps the poll loop cheap.
+type GetUpdatesParams struct {
+	Offset         int64    `json:"offset,omitempty"`
+	Timeout        int      `json:"timeout,omitempty"`
+	AllowedUpdates []string `json:"allowed_updates,omitempty"`
+}
+
+// GetUpdates invokes the Bot API getUpdates method. It returns the batch of
+// updates Telegram has buffered since Offset. A getUpdates call fails with a
+// 409 (telegramError) while a webhook is active — callers must DeleteWebhook
+// first. The context deadline must comfortably exceed Timeout so the HTTP
+// client does not abort a healthy long-poll.
+func (c *APIClient) GetUpdates(ctx context.Context, p GetUpdatesParams) ([]Update, error) {
+	raw, err := c.callJSON(ctx, "getUpdates", p)
+	if err != nil {
+		return nil, err
+	}
+	var updates []Update
+	if err := json.Unmarshal(raw, &updates); err != nil {
+		return nil, fmt.Errorf("decode getUpdates result: %w", err)
+	}
+	return updates, nil
+}
+
 // BotUser is the subset of the getMe response the bot config flow needs.
 // It identifies the bot account behind a token: the numeric id and the
 // @username a user types in Telegram to find it.

@@ -129,15 +129,38 @@ func (a *Adapter) VerifyWebhookSignature(headers http.Header, _ []byte) error {
 // HandleWebhook decodes a Telegram Update and converts it into zero or one
 // InboundMessage. Service updates (non-message types) yield an empty slice
 // rather than an error so callers can no-op cleanly.
+//
+// HandleWebhook and Poll both funnel through updateToInbound so a message
+// produces an identical InboundMessage regardless of the ingress mode — the
+// relay must be mode-agnostic.
 func (a *Adapter) HandleWebhook(_ context.Context, body []byte, _ http.Header) ([]provider.InboundMessage, error) {
 	var update Update
 	if err := json.Unmarshal(body, &update); err != nil {
 		return nil, fmt.Errorf("telegram: decode update: %w", err)
 	}
-	if update.Message == nil {
+	in, ok := updateToInbound(update, body)
+	if !ok {
 		// Edited messages, channel posts, callback queries, etc. are not
 		// supported in v1; surface as empty rather than as an error.
 		return nil, nil
+	}
+	return []provider.InboundMessage{in}, nil
+}
+
+// updateToInbound is the single Update→InboundMessage conversion used by BOTH
+// the webhook path (HandleWebhook) and the long-poll path (Poll). Keeping it
+// in one place guarantees a given Telegram message yields a byte-identical
+// InboundMessage whichever ingress mode delivered it, so the relay never has
+// to care which one is active.
+//
+// rawJSON is the exact bytes the update was decoded from; it is stored verbatim
+// for audit. The poll loop re-marshals each update so RawJSON stays populated
+// (getUpdates returns a batch, not per-update bodies).
+//
+// ok is false for updates that carry no message (edits, channel posts, etc.).
+func updateToInbound(update Update, rawJSON []byte) (provider.InboundMessage, bool) {
+	if update.Message == nil {
+		return provider.InboundMessage{}, false
 	}
 
 	msg := update.Message
@@ -152,19 +175,16 @@ func (a *Adapter) HandleWebhook(_ context.Context, body []byte, _ http.Header) (
 		text = msg.Caption
 	}
 
-	attachments := extractAttachments(msg)
-
-	in := provider.InboundMessage{
+	return provider.InboundMessage{
 		Provider:          ProviderName,
 		ProviderUserID:    providerUserID,
 		ProviderChatID:    strconv.FormatInt(msg.Chat.ID, 10),
 		Text:              text,
-		Attachments:       attachments,
+		Attachments:       extractAttachments(msg),
 		ReceivedAt:        time.Now().UTC(),
 		ProviderMessageID: strconv.FormatInt(update.UpdateID, 10),
-		RawJSON:           append([]byte(nil), body...),
-	}
-	return []provider.InboundMessage{in}, nil
+		RawJSON:           append([]byte(nil), rawJSON...),
+	}, true
 }
 
 // extractAttachments translates Telegram media payloads to provider.Attachment.
@@ -291,4 +311,67 @@ func (a *Adapter) SetupWebhook(ctx context.Context, baseURL string) error {
 		SecretToken:    a.webhookSecret,
 		AllowedUpdates: []string{"message"},
 	})
+}
+
+// longPollTimeout is the server-side hold time for a getUpdates call. A long
+// hold keeps the loop near-idle: the call returns the instant a message
+// arrives, otherwise after this many seconds.
+const longPollTimeout = 30 * time.Second
+
+// pollHTTPSlack is added to longPollTimeout to derive the per-call HTTP
+// deadline, so the client does not abort a healthy long-poll that is simply
+// waiting out its full server-side window.
+const pollHTTPSlack = 15 * time.Second
+
+// DeleteWebhook removes any webhook registered for this bot. getUpdates and a
+// webhook are mutually exclusive — Telegram returns 409 from getUpdates while
+// a webhook is active — so the poll loop calls this once before it starts.
+func (a *Adapter) DeleteWebhook(ctx context.Context) error {
+	return a.api.DeleteWebhook(ctx)
+}
+
+// Poll performs a single long-poll getUpdates call starting at offset and
+// returns the decoded inbound messages plus the offset to use for the next
+// call (max(update_id)+1, or the input offset unchanged when the batch is
+// empty). Non-message updates are dropped silently.
+//
+// A revoked/invalid token surfaces as provider.ErrUnauthorized so the poll
+// loop can stop instead of backing off forever. Every other error (network,
+// 5xx, 409) is returned wrapped for the caller's backoff to handle.
+func (a *Adapter) Poll(ctx context.Context, offset int64) ([]provider.InboundMessage, int64, error) {
+	callCtx, cancel := context.WithTimeout(ctx, longPollTimeout+pollHTTPSlack)
+	defer cancel()
+
+	updates, err := a.api.GetUpdates(callCtx, GetUpdatesParams{
+		Offset:         offset,
+		Timeout:        int(longPollTimeout / time.Second),
+		AllowedUpdates: []string{"message"},
+	})
+	if err != nil {
+		if te, ok := AsTelegramError(err); ok && te.Code() == http.StatusUnauthorized {
+			return nil, offset, fmt.Errorf("%w: telegram getUpdates 401", provider.ErrUnauthorized)
+		}
+		return nil, offset, fmt.Errorf("telegram: getUpdates: %w", err)
+	}
+
+	next := offset
+	out := make([]provider.InboundMessage, 0, len(updates))
+	for _, u := range updates {
+		// Advance the offset for EVERY update id, including ones we drop —
+		// otherwise an unsupported update (an edit, say) would be re-fetched
+		// on every poll forever.
+		if u.UpdateID >= next {
+			next = u.UpdateID + 1
+		}
+		raw, mErr := json.Marshal(u)
+		if mErr != nil {
+			// Should never happen for a struct we just decoded; skip the
+			// audit JSON rather than abort the whole batch.
+			raw = nil
+		}
+		if in, ok := updateToInbound(u, raw); ok {
+			out = append(out, in)
+		}
+	}
+	return out, next, nil
 }

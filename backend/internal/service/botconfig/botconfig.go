@@ -5,8 +5,16 @@
 // API or OAuth path. The in-app wizard therefore hands the user off to a
 // t.me/botfather deep link and takes the resulting token back: this service
 // validates that token (getMe), seals it under the per-tenant crypto envelope,
-// registers the webhook + command menu with Telegram, and swaps the live
-// in-process adapter so the bot starts relaying with no redeploy.
+// registers the command menu with Telegram, and swaps the live in-process
+// adapter so the bot starts relaying with no redeploy.
+//
+// Inbound mode (moses-chat-bot-9so): the bot receives messages by long-polling
+// getUpdates by default — a purely outbound model that works behind the Moses
+// per-app auth gate with no public URL or tunnel. This service owns the poll
+// loop's lifecycle: it starts the loop on Connect / LoadAtStartup, stops it on
+// Disconnect, and restarts it when the live adapter is swapped. Webhook is the
+// opt-in alternative, enabled only when BOT_WEBHOOK_PUBLIC_URL is set; in that
+// mode Connect registers a webhook instead of starting a poll loop.
 //
 // Scoping: the bot configuration + token are TENANT-scoped (one row per
 // tenant in telegram_bot_config). Connect/Disconnect are gated to tenant
@@ -78,11 +86,13 @@ type Info struct {
 type adapterBuilder func(token, webhookSecret string) (*telegram.Adapter, error)
 
 // Service owns the tenant Telegram bot lifecycle: persistence, encryption, the
-// Telegram API hand-offs, and the live in-process adapter registration.
+// Telegram API hand-offs, the live in-process adapter registration, and the
+// inbound poll loop.
 //
 // v1 is single-tenant per deploy (one bot per Moses instance), so the Service
-// keeps exactly one live adapter. The webhook handler resolves the active
-// adapter through ActiveAdapter; multi-bot fan-out is a future bead.
+// keeps exactly one live adapter and at most one poll loop. The webhook handler
+// resolves the active adapter through ActiveAdapter; multi-bot fan-out is a
+// future bead.
 type Service struct {
 	store    *db.Store
 	envelope *crypto.Envelope
@@ -91,8 +101,26 @@ type Service struct {
 
 	build adapterBuilder
 
+	// dispatcher is the relay entrypoint the poll loop feeds. nil disables
+	// long-polling (the loop is never started) — useful for tests that only
+	// exercise persistence. main.go always wires it.
+	dispatcher telegram.InboundDispatcher
+
+	// webhookPublicURL is BOT_WEBHOOK_PUBLIC_URL. When non-empty the bot runs
+	// in opt-in webhook mode: Connect registers a webhook at this base URL and
+	// no poll loop is started. When empty (the default) the bot long-polls.
+	webhookPublicURL string
+
+	// loopCtx is the long-lived parent context for HandleInbound dispatch — it
+	// must outlive a single poll iteration so a slow MM round-trip survives a
+	// loop restart. Set once via SetLoopContext.
+	loopCtx context.Context
+
 	mu      sync.RWMutex
 	adapter *telegram.Adapter
+	// cancelLoop stops the currently running poll loop; nil when none runs
+	// (webhook mode, or before the first Connect/LoadAtStartup).
+	cancelLoop context.CancelFunc
 }
 
 // New constructs a Service. registry is the shared provider registry the relay
@@ -106,12 +134,13 @@ func New(store *db.Store, envelope *crypto.Envelope, registry *provider.Registry
 		envelope: envelope,
 		registry: registry,
 		logger:   logger,
+		loopCtx:  context.Background(),
 		build: func(token, webhookSecret string) (*telegram.Adapter, error) {
 			return telegram.New(telegram.Config{
 				BotToken:      token,
 				WebhookSecret: webhookSecret,
 				// AutoSetup stays false — botconfig drives setWebhook itself
-				// with the URL derived from the connect request's Host header.
+				// in opt-in webhook mode.
 				AutoSetup: false,
 				Logger:    nil,
 			})
@@ -122,6 +151,57 @@ func New(store *db.Store, envelope *crypto.Envelope, registry *provider.Registry
 // SetAdapterBuilder overrides the adapter constructor. Tests use it to point the
 // adapter (and its API client) at a stub Telegram server.
 func (s *Service) SetAdapterBuilder(b adapterBuilder) { s.build = b }
+
+// SetInboundDispatcher wires the relay entrypoint the poll loop feeds. It must
+// be called before LoadAtStartup / Connect for long-polling to take effect.
+// main.go calls it once with the relay.Inbound service.
+func (s *Service) SetInboundDispatcher(d telegram.InboundDispatcher) { s.dispatcher = d }
+
+// SetLoopContext sets the long-lived parent context for poll-loop message
+// dispatch. main.go passes the process root context so an in-flight MM
+// round-trip is not aborted when a loop is restarted on an adapter swap.
+func (s *Service) SetLoopContext(ctx context.Context) {
+	if ctx != nil {
+		s.loopCtx = ctx
+	}
+}
+
+// SetWebhookPublicURL enables opt-in webhook mode. base is BOT_WEBHOOK_PUBLIC_URL
+// (scheme://host[/path]); when non-empty Connect registers a webhook at it
+// instead of starting a poll loop. Empty (the default) keeps long-polling.
+func (s *Service) SetWebhookPublicURL(base string) {
+	s.webhookPublicURL = strings.TrimRight(strings.TrimSpace(base), "/")
+}
+
+// webhookMode reports whether the bot runs in opt-in webhook mode.
+func (s *Service) webhookMode() bool { return s.webhookPublicURL != "" }
+
+// startPollLoop launches a fresh poll loop for adapter, cancelling any loop
+// already running. Callers must hold s.mu. It is a no-op in webhook mode or
+// when no dispatcher is wired.
+func (s *Service) startPollLoop(adapter *telegram.Adapter) {
+	if s.webhookMode() || s.dispatcher == nil {
+		return
+	}
+	s.stopPollLoopLocked()
+	loopCtx, cancel := context.WithCancel(context.Background())
+	s.cancelLoop = cancel
+	loop := telegram.NewPollLoop(adapter, s.dispatcher, s.loopCtx, s.logger)
+	go func() {
+		// Run returns nil on clean ctx-cancel and a terminal error on a
+		// revoked token; the loop logs both, so nothing else to do here.
+		_ = loop.Run(loopCtx)
+	}()
+}
+
+// stopPollLoopLocked cancels the running poll loop, if any. Callers must hold
+// s.mu.
+func (s *Service) stopPollLoopLocked() {
+	if s.cancelLoop != nil {
+		s.cancelLoop()
+		s.cancelLoop = nil
+	}
+}
 
 // ActiveAdapter returns the live Telegram adapter, or nil when no bot is
 // connected. The webhook handler calls this on every request so a connect /
@@ -170,9 +250,11 @@ func (s *Service) LoadAtStartup(ctx context.Context, envFallbackToken, envFallba
 		}
 		s.mu.Lock()
 		s.adapter = adapter
+		s.startPollLoop(adapter)
 		s.mu.Unlock()
 		s.logger.Info("botconfig: registered telegram bot from stored config",
-			slog.String("tenant_id", cfg.TenantID.String()))
+			slog.String("tenant_id", cfg.TenantID.String()),
+			slog.String("inbound_mode", s.inboundModeLabel()))
 		return adapter, nil
 	}
 
@@ -199,16 +281,34 @@ func (s *Service) LoadAtStartup(ctx context.Context, envFallbackToken, envFallba
 	}
 	s.mu.Lock()
 	s.adapter = adapter
+	s.startPollLoop(adapter)
 	s.mu.Unlock()
-	s.logger.Warn("botconfig: registered telegram bot from TELEGRAM_BOT_TOKEN env fallback (no DB config)")
+	s.logger.Warn("botconfig: registered telegram bot from TELEGRAM_BOT_TOKEN env fallback (no DB config)",
+		slog.String("inbound_mode", s.inboundModeLabel()))
 	return adapter, nil
 }
 
+// inboundModeLabel returns a human label for the active inbound mode, for logs.
+func (s *Service) inboundModeLabel() string {
+	if s.webhookMode() {
+		return "webhook"
+	}
+	return "long-polling"
+}
+
 // Connect validates token via Telegram getMe, persists it encrypted, registers
-// the webhook + command menu, and swaps the live adapter — all without a
-// redeploy. webhookBaseURL is the scheme://host the webhook is reachable on,
-// derived by the handler from the request Host header + MOSES_BASE_PATH; the
-// webhook path suffix is appended here.
+// the command menu, swaps the live adapter, and starts inbound delivery — all
+// without a redeploy.
+//
+// Inbound mode (moses-chat-bot-9so):
+//   - Default (long-polling): Connect calls deleteWebhook — getUpdates 409s
+//     while a webhook is active — then starts an in-process poll loop. It does
+//     NOT call setWebhook. Long-polling is purely outbound, so the bot works
+//     behind the Moses per-app auth gate with no public URL.
+//   - Opt-in (webhook): when BOT_WEBHOOK_PUBLIC_URL is set, Connect registers
+//     a webhook at that base URL instead and starts no poll loop. webhookBaseURL
+//     (derived by the handler from the request Host) is the fallback base when
+//     BOT_WEBHOOK_PUBLIC_URL is itself empty of a path.
 //
 // On any failure after the getMe validation the persisted row is left untouched
 // (we only upsert once the token is proven good), so a partial failure never
@@ -257,16 +357,30 @@ func (s *Service) Connect(ctx context.Context, tenantID, userID uuid.UUID, token
 		return nil, fmt.Errorf("botconfig: persist config: %w", err)
 	}
 
-	// 3. Register the webhook with Telegram. The row is already persisted; a
-	//    setWebhook failure surfaces to the admin but the token is saved, so a
-	//    retry of Connect re-runs setWebhook against the same config.
-	target := strings.TrimRight(webhookBaseURL, "/") + telegram.WebhookPath()
-	if err := api.SetWebhook(ctx, telegram.SetWebhookParams{
-		URL:            target,
-		SecretToken:    webhookSecret,
-		AllowedUpdates: []string{"message"},
-	}); err != nil {
-		return nil, fmt.Errorf("botconfig: setWebhook: %w", err)
+	// 3. Configure inbound delivery with Telegram. The row is already
+	//    persisted; a failure here surfaces to the admin but the token is
+	//    saved, so a retry of Connect re-runs this step against the same config.
+	if s.webhookMode() {
+		base := s.webhookPublicURL
+		if base == "" {
+			base = strings.TrimRight(webhookBaseURL, "/")
+		}
+		target := base + telegram.WebhookPath()
+		if err := api.SetWebhook(ctx, telegram.SetWebhookParams{
+			URL:            target,
+			SecretToken:    webhookSecret,
+			AllowedUpdates: []string{"message"},
+		}); err != nil {
+			return nil, fmt.Errorf("botconfig: setWebhook: %w", err)
+		}
+	} else {
+		// Long-polling: getUpdates and a webhook are mutually exclusive, so
+		// drop any webhook a prior webhook-mode deploy left behind. The poll
+		// loop also does this on start; doing it here makes the mode switch
+		// take effect before the first poll.
+		if err := api.DeleteWebhook(ctx); err != nil {
+			return nil, fmt.Errorf("botconfig: deleteWebhook: %w", err)
+		}
 	}
 
 	// 4. Register the command menu (best-effort — a failure here does not
@@ -277,17 +391,20 @@ func (s *Service) Connect(ctx context.Context, tenantID, userID uuid.UUID, token
 			slog.String("err", err.Error()))
 	}
 
-	// 5. Swap the live adapter so inbound + outbound start working now.
+	// 5. Swap the live adapter so outbound (and webhook-mode inbound) start
+	//    working now, and (re)start the poll loop in long-polling mode.
 	if err := s.registry.Replace(adapter); err != nil {
 		return nil, fmt.Errorf("botconfig: register adapter: %w", err)
 	}
 	s.mu.Lock()
 	s.adapter = adapter
+	s.startPollLoop(adapter)
 	s.mu.Unlock()
 
 	s.logger.Info("botconfig: telegram bot connected",
 		slog.String("tenant_id", tenantID.String()),
-		slog.String("bot_username", botUsername))
+		slog.String("bot_username", botUsername),
+		slog.String("inbound_mode", s.inboundModeLabel()))
 
 	return &Info{Configured: true, Username: botUsername}, nil
 }
@@ -330,6 +447,7 @@ func (s *Service) Disconnect(ctx context.Context, tenantID uuid.UUID) error {
 	s.registry.Remove(telegram.ProviderName)
 	s.mu.Lock()
 	s.adapter = nil
+	s.stopPollLoopLocked()
 	s.mu.Unlock()
 
 	s.logger.Info("botconfig: telegram bot disconnected", slog.String("tenant_id", tenantID.String()))

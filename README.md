@@ -42,8 +42,8 @@ key carries your permissions natively.
 4. Tell your users they can now open **Chat Bot Bridge** from `/apps` and link
    their Telegram. Full user flow lives in [docs/USER_GUIDE.md](./docs/USER_GUIDE.md).
 
-See [docs/ADMIN_GUIDE.md](./docs/ADMIN_GUIDE.md) for secret rotation, webhook setup,
-and uninstall semantics.
+See [docs/ADMIN_GUIDE.md](./docs/ADMIN_GUIDE.md) for secret rotation, inbound-mode
+configuration, and uninstall semantics.
 
 ## Quick start (user)
 
@@ -62,7 +62,8 @@ Telegram client
       │   (HTTPS)
       ▼
 Telegram Bot API
-      │   webhook POST (X-Telegram-Bot-Api-Secret-Token verified)
+      │   getUpdates long-poll — the bot pulls updates (default).
+      │   Webhook POST is the opt-in alternative (BOT_WEBHOOK_PUBLIC_URL).
       ▼
 moses-chat-bot backend (this app)
       │   1. Resolve link → decrypt user API key

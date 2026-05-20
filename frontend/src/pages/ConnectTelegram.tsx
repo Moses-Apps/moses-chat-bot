@@ -4,8 +4,13 @@
 // API or OAuth path. This wizard therefore does NOT emulate BotFather; it hands
 // the admin off via a https://t.me/botfather deep link, gives copy-paste-ready
 // commands, then takes the resulting token back through a paste field and
-// POSTs it to the backend (which validates it, encrypts it at rest, and
-// registers the webhook).
+// POSTs it to the backend.
+//
+// The backend validates the token, encrypts it at rest, and immediately starts
+// receiving messages by long-polling Telegram (moses-chat-bot-9so) — a purely
+// outbound model that needs no webhook, no public URL, and no tunnel. The
+// honest displayed flow is therefore just two steps: create the bot with
+// BotFather, then paste the token. There is nothing else for the admin to do.
 //
 // The route is admin-gated: a non-admin viewer sees a "permission required"
 // card instead of the wizard.
@@ -233,8 +238,8 @@ export default function ConnectTelegram(): ReactElement {
               <RouterLink to="/link/new" className="text-moses-accent hover:underline">
                 Link a chat
               </RouterLink>
-              . The webhook and command menu were configured automatically — no
-              redeploy needed.
+              . The bot is already receiving messages — no webhook, no public
+              URL, and no redeploy needed.
             </p>
             {error && (
               <p role="alert" className="text-sm text-moses-status-error">
