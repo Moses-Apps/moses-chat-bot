@@ -277,8 +277,8 @@ func (i *Inbound) dispatchCommand(
 			return true, i.replyText(ctx, link, "Usage: /autopilot start|stop|status")
 		}
 		var (
-			reply   string
-			err     error
+			reply string
+			err   error
 		)
 		switch cmd.Args[0] {
 		case "start":
@@ -390,6 +390,30 @@ func (i *Inbound) replyText(ctx context.Context, link *db.ChatRelayLink, text st
 	return err
 }
 
+// buildRelayPrompt wraps the user's provider-chat message with relay context
+// for Moses Manager. It tells MM (a) the turn reply is delivered back to the
+// chat automatically so it should just answer normally, and (b) how to send
+// asynchronous follow-up messages to this SAME chat after the turn ends —
+// via the chat-bot app's `notifyLink` workspace tool, keyed by this link's
+// ID — for work that outlives the turn (deployments, autopilot runs, long
+// tasks). Without the link ID, MM has no way to address the chat for a
+// later push; without the instruction, it does not know the surface exists.
+func buildRelayPrompt(link *db.ChatRelayLink, msg provider.InboundMessage) string {
+	return fmt.Sprintf(`[moses-chat-bot relay context]
+This message was relayed from a %s chat. Your reply to this turn is delivered
+back to that chat automatically — just answer normally; do NOT call a tool to
+send your immediate reply (it would post twice).
+
+If you start work that finishes AFTER this turn ends (a deployment, an
+autopilot run, any long-running task), send progress or result updates to
+this same chat later with the chat-bot app's "notifyLink" workspace tool:
+  - chat link id: %s
+  - arguments: {"id": "%s", "text": "<your update>"}
+
+User's message:
+%s`, capitalize(msg.Provider), link.ID, link.ID, msg.Text)
+}
+
 // dispatchToMM resolves the per-chat conversation, subscribes to the WS,
 // fires the streaming chat request, aggregates events, and replies.
 func (i *Inbound) dispatchToMM(
@@ -440,17 +464,22 @@ func (i *Inbound) dispatchToMM(
 	}
 	logger = logger.With(slog.String("conversation_id", conversationID.String()))
 
+	// What MM actually receives: the user's text wrapped with relay context
+	// (chat link id + how to push async follow-ups). Built once and used for
+	// both the streaming path and the sync fallback.
+	relayPrompt := buildRelayPrompt(link, msg)
+
 	// Subscribe BEFORE firing the stream so we don't lose early chunks.
 	sub, err := i.WSPool.Get(ctx, link.ID, bearer, conversationID)
 	if err != nil {
 		logger.Warn("ws subscribe failed; falling back to sync", slog.String("err", err.Error()))
-		return i.syncFallback(ctx, link, chatClient, conversationID, msg.Text, "ws_subscribe_failed", logger)
+		return i.syncFallback(ctx, link, chatClient, conversationID, relayPrompt, "ws_subscribe_failed", logger)
 	}
 	i.WSPool.Touch(link.ID)
 
 	// Fire the stream request.
 	if _, err := chatClient.StreamChatMessage(ctx, mosesclient.ChatStreamOpts{
-		Message:        msg.Text,
+		Message:        relayPrompt,
 		ConversationID: conversationID.String(),
 	}); err != nil {
 		if errors.Is(err, mosesclient.ErrUnauthorized) {
@@ -458,7 +487,7 @@ func (i *Inbound) dispatchToMM(
 			return err
 		}
 		logger.Warn("stream rpc failed; falling back to sync", slog.String("err", err.Error()))
-		return i.syncFallback(ctx, link, chatClient, conversationID, msg.Text, "stream_dispatch_failed", logger)
+		return i.syncFallback(ctx, link, chatClient, conversationID, relayPrompt, "stream_dispatch_failed", logger)
 	}
 
 	// Aggregate events.

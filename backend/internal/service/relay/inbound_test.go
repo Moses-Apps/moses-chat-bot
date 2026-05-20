@@ -714,3 +714,20 @@ func seedLink(fx *inboundFixture, providerName, providerUserID string) db.ChatRe
 func init() {
 	_ = errors.New("force import")
 }
+
+// TestBuildRelayPrompt pins the relay-context contract: Moses Manager must
+// receive the user's text, the chat link id to address async follow-ups to,
+// a pointer at the notifyLink workspace tool, and the do-not-double-post
+// instruction for the immediate reply.
+func TestBuildRelayPrompt(t *testing.T) {
+	link := &db.ChatRelayLink{ID: uuid.New()}
+	msg := provider.InboundMessage{Provider: "telegram", Text: "deploy my app please"}
+
+	got := buildRelayPrompt(link, msg)
+
+	assert.Contains(t, got, "deploy my app please", "user's actual text must be relayed")
+	assert.Contains(t, got, link.ID.String(), "MM must know which chat (link id) to address")
+	assert.Contains(t, got, "notifyLink", "MM must be pointed at the notifyLink workspace tool")
+	assert.Contains(t, got, "twice", "MM must be told not to tool-send its immediate reply")
+	assert.Contains(t, got, "Telegram", "provider name should be surfaced, capitalized")
+}
