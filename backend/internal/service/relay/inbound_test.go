@@ -515,6 +515,28 @@ func TestHandleInbound_SlashLink_Unlinked_ReachesLinker(t *testing.T) {
 	assert.NotContains(t, sent[0].Msg.Text, "don't recognise")
 }
 
+// TestHandleInbound_AutopilotMixedCase_HandledAsCommand is the regression
+// guard for the reported bug: "/autopilot Start" (mobile keyboards
+// autocapitalise) was rejected by the case-sensitive arg parser and silently
+// forwarded to Moses Manager as a chat message. It must be dispatched as the
+// autopilot command. The fixture wires no Autopilot service, so the command
+// path replies "not configured" — a reply only dispatchCommand produces,
+// proving the message was NOT relayed to MM.
+func TestHandleInbound_AutopilotMixedCase_HandledAsCommand(t *testing.T) {
+	fx := newFixture(t, newFakeSubscriber(8))
+	seedLink(fx, "telegram", "tg-ap")
+
+	msg := provider.InboundMessage{
+		Provider: "telegram", ProviderUserID: "tg-ap", ProviderChatID: "tg-ap",
+		Text: "/autopilot Start", ProviderMessageID: "ap-1", ReceivedAt: time.Now(),
+	}
+	require.NoError(t, fx.relay.HandleInbound(context.Background(), msg))
+
+	sent := fx.tg.Snapshot()
+	require.Len(t, sent, 1)
+	assert.Contains(t, sent[0].Msg.Text, "Autopilot service not configured")
+}
+
 func TestHandleInbound_SlashClear_ResetsConversation(t *testing.T) {
 	fx := newFixture(t, newFakeSubscriber(8))
 	link := seedLink(fx, "telegram", "tg-clear")

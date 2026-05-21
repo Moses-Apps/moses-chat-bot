@@ -202,7 +202,12 @@ func (i *Inbound) HandleInbound(ctx context.Context, msg provider.InboundMessage
 	_ = i.Store.TouchLastUsed(ctx, link.TenantID, link.ID)
 
 	// 4. Slash command dispatch (cmd/parseErr were parsed at the top).
-	if parseErr == nil {
+	// A clean parse (parseErr == nil) AND a recognised verb with bad args
+	// (ErrInvalidArgs — e.g. "/autopilot wat") both carry a usable Verb, so
+	// both are dispatched: the user gets a command reply (a usage hint for
+	// bad args) instead of having a "/command ..." message silently
+	// forwarded to Moses Manager.
+	if parseErr == nil || errors.Is(parseErr, commands.ErrInvalidArgs) {
 		handled, err := i.dispatchCommand(ctx, link, msg, cmd)
 		if err != nil {
 			logger.Warn("command dispatch failed", slog.String("verb", cmd.Verb), slog.String("err", err.Error()))
@@ -214,7 +219,7 @@ func (i *Inbound) HandleInbound(ctx context.Context, msg provider.InboundMessage
 	} else if errors.Is(parseErr, commands.ErrNotACommand) {
 		// not a command — fall through to MM
 	} else {
-		// Unknown / invalid command — let MM interpret it.
+		// Unknown slash command (ErrUnknownCommand) — let MM interpret it.
 		logger.Debug("command parse non-fatal", slog.String("err", parseErr.Error()))
 	}
 
@@ -280,7 +285,9 @@ func (i *Inbound) dispatchCommand(
 			reply string
 			err   error
 		)
-		switch cmd.Args[0] {
+		// Lowercase the subcommand — Parse keeps args verbatim and mobile
+		// keyboards autocapitalise ("/autopilot Start").
+		switch strings.ToLower(cmd.Args[0]) {
 		case "start":
 			reply, err = i.Autopilot.Start(ctx, link, msg.ProviderChatID)
 		case "stop":

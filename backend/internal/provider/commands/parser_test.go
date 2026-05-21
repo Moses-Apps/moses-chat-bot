@@ -45,6 +45,9 @@ func TestParse(t *testing.T) {
 		{name: "autopilot bogus", in: "/autopilot bogus", wantErr: commands.ErrInvalidArgs},
 		{name: "autopilot no arg", in: "/autopilot", wantErr: commands.ErrInvalidArgs},
 		{name: "autopilot extra args", in: "/autopilot start now", wantErr: commands.ErrInvalidArgs},
+		// Mobile keyboards autocapitalise — "/autopilot Start" must parse.
+		{name: "autopilot autocapitalised start", in: "/autopilot Start", verb: "/autopilot", args: []string{"Start"}},
+		{name: "autopilot uppercase status", in: "/autopilot STATUS", verb: "/autopilot", args: []string{"STATUS"}},
 
 		{name: "use ok", in: "/use my-tenant", verb: "/use", args: []string{"my-tenant"}},
 		{name: "use digits", in: "/use tenant-7", verb: "/use", args: []string{"tenant-7"}},
@@ -85,6 +88,19 @@ func TestParse(t *testing.T) {
 				t.Fatalf("Parse(%q) args=%v, want %v", tc.in, cmd.Args, tc.args)
 			}
 		})
+	}
+}
+
+// TestParse_InvalidArgsKeepsVerb pins the contract that lets the relay route a
+// recognised-but-malformed command (e.g. "/autopilot wat") to a usage reply
+// instead of silently forwarding the "/command ..." text to Moses Manager.
+func TestParse_InvalidArgsKeepsVerb(t *testing.T) {
+	cmd, err := commands.Parse("/autopilot wat")
+	if !errors.Is(err, commands.ErrInvalidArgs) {
+		t.Fatalf("err=%v, want ErrInvalidArgs", err)
+	}
+	if cmd.Verb != "/autopilot" {
+		t.Fatalf("verb=%q, want /autopilot — the relay needs the verb to route it", cmd.Verb)
 	}
 }
 

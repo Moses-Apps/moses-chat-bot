@@ -26,10 +26,10 @@ var (
 )
 
 var (
-	linkCodeRE  = regexp.MustCompile(`^[0-9a-fA-F]{6}$`)
-	tenantRE    = regexp.MustCompile(`^[a-z0-9-]{1,64}$`)
-	dndDayRE    = regexp.MustCompile(`^[1-7]d$`)
-	verbRE      = regexp.MustCompile(`^/[a-z][a-z0-9_]*$`)
+	linkCodeRE = regexp.MustCompile(`^[0-9a-fA-F]{6}$`)
+	tenantRE   = regexp.MustCompile(`^[a-z0-9-]{1,64}$`)
+	dndDayRE   = regexp.MustCompile(`^[1-7]d$`)
+	verbRE     = regexp.MustCompile(`^/[a-z][a-z0-9_]*$`)
 )
 
 // argSpec validates the args of a recognized verb. nil means zero args.
@@ -70,7 +70,11 @@ func Parse(text string) (Command, error) {
 		return Command{}, ErrUnknownCommand
 	}
 	if err := spec(args); err != nil {
-		return Command{}, err
+		// Return the recognised verb alongside the error so the relay can
+		// still route a known-but-malformed command (e.g. "/autopilot wat")
+		// to its handler — which replies with a usage hint — instead of
+		// silently forwarding a "/command ..." message to Moses Manager.
+		return Command{Verb: verb, Args: args}, err
 	}
 	return Command{Verb: verb, Args: args}, nil
 }
@@ -100,7 +104,9 @@ func autopilotArgs(args []string) error {
 	if len(args) != 1 {
 		return ErrInvalidArgs
 	}
-	switch args[0] {
+	// Case-insensitive: mobile keyboards autocapitalise, so a user typing
+	// "/autopilot start" frequently sends "/autopilot Start".
+	switch strings.ToLower(args[0]) {
 	case "start", "stop", "status":
 		return nil
 	default:
