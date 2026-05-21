@@ -557,62 +557,28 @@ func TestHandleInbound_SlashClear_ResetsConversation(t *testing.T) {
 	assert.Nil(t, state.MosesConversationID, "/clear should null the conversation pointer")
 }
 
-func TestHandleInbound_RegularMessage_StreamsThroughWS(t *testing.T) {
-	sub := newFakeSubscriber(8)
-	fx := newFixture(t, sub)
+func TestHandleInbound_RegularMessage_DeliversViaSync(t *testing.T) {
+	fx := newFixture(t, newFakeSubscriber(1))
 	link := seedLink(fx, "telegram", "tg-mm")
+	fx.chat.syncMessage = "Hello world!"
 
-	// Drive the stream aggregation: emit 2 chunks then complete BEFORE
-	// HandleInbound calls Events() so we don't race.
-	done := make(chan error, 1)
-	go func() {
-		msg := provider.InboundMessage{
-			Provider: "telegram", ProviderUserID: "tg-mm", ProviderChatID: "tg-mm",
-			Text: "say hi", ProviderMessageID: "mm-1", ReceivedAt: time.Now(),
-		}
-		done <- fx.relay.HandleInbound(context.Background(), msg)
-	}()
-
-	// Wait until StreamChatMessage has been called — that tells us
-	// HandleInbound is inside the WS event loop.
-	require.Eventually(t, func() bool {
-		fx.chat.mu.Lock()
-		defer fx.chat.mu.Unlock()
-		return fx.chat.streamCalls >= 1
-	}, time.Second, 5*time.Millisecond)
-
-	// Pull the conversation ID off the chat client.
-	fx.chat.mu.Lock()
-	convStr := fx.chat.lastConvID
-	fx.chat.mu.Unlock()
-
-	sub.push(mosesclient.WSEvent{
-		Type:           "assistant_message_chunk",
-		ConversationID: convStr,
-		Message:        []byte(`{"content":"Hello "}`),
-	})
-	sub.push(mosesclient.WSEvent{
-		Type:           "assistant_message_chunk",
-		ConversationID: convStr,
-		Message:        []byte(`{"content":"world!"}`),
-	})
-	sub.push(mosesclient.WSEvent{
-		Type:           "assistant_message_complete",
-		ConversationID: convStr,
-	})
-
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("HandleInbound did not return")
+	msg := provider.InboundMessage{
+		Provider: "telegram", ProviderUserID: "tg-mm", ProviderChatID: "tg-mm",
+		Text: "say hi", ProviderMessageID: "mm-1", ReceivedAt: time.Now(),
 	}
+	require.NoError(t, fx.relay.HandleInbound(context.Background(), msg))
+
+	// MM's reply is fetched via the synchronous chat call and relayed as one
+	// Telegram message.
+	fx.chat.mu.Lock()
+	assert.GreaterOrEqual(t, fx.chat.syncCalls, 1, "expected the synchronous chat path")
+	fx.chat.mu.Unlock()
 
 	sent := fx.tg.Snapshot()
 	require.Len(t, sent, 1)
 	assert.Equal(t, "Hello world!", sent[0].Msg.Text)
 
-	// Outbound row persisted with conversation id.
+	// Outbound row persisted with the conversation id.
 	out := fx.store.outbound()
 	require.Len(t, out, 1)
 	require.NotNil(t, out[0].MosesConversationID)
@@ -641,64 +607,6 @@ func TestHandleInbound_401_DeactivatesLink_NotifiesUser(t *testing.T) {
 	sent := fx.tg.Snapshot()
 	require.Len(t, sent, 1)
 	assert.Contains(t, sent[0].Msg.Text, "revoked")
-}
-
-func TestHandleInbound_WSDisconnect_FallsBackToSyncPath(t *testing.T) {
-	sub := newFakeSubscriber(2)
-	fx := newFixture(t, sub)
-	seedLink(fx, "telegram", "tg-discon")
-	fx.chat.syncMessage = "Fallback reply"
-
-	done := make(chan error, 1)
-	go func() {
-		msg := provider.InboundMessage{
-			Provider: "telegram", ProviderUserID: "tg-discon", ProviderChatID: "tg-discon",
-			Text: "hi", ProviderMessageID: "d-1", ReceivedAt: time.Now(),
-		}
-		done <- fx.relay.HandleInbound(context.Background(), msg)
-	}()
-
-	require.Eventually(t, func() bool {
-		fx.chat.mu.Lock()
-		defer fx.chat.mu.Unlock()
-		return fx.chat.streamCalls >= 1
-	}, time.Second, 5*time.Millisecond)
-
-	// Emit a terminal error to mimic ws give-up, then close.
-	sub.push(mosesclient.WSEvent{Type: "error"})
-
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("HandleInbound did not return after disconnect")
-	}
-
-	// Sync path called → reply text matches our stub.
-	fx.chat.mu.Lock()
-	assert.GreaterOrEqual(t, fx.chat.syncCalls, 1)
-	fx.chat.mu.Unlock()
-
-	sent := fx.tg.Snapshot()
-	require.Len(t, sent, 1)
-	assert.Equal(t, "Fallback reply", sent[0].Msg.Text)
-}
-
-func TestHandleInbound_StreamTimeout_TellsUserToRetry(t *testing.T) {
-	sub := newFakeSubscriber(2)
-	fx := newFixture(t, sub)
-	// Shorten timeout further so the test runs fast.
-	fx.relay.StreamTimeout = 100 * time.Millisecond
-	seedLink(fx, "telegram", "tg-to")
-
-	msg := provider.InboundMessage{
-		Provider: "telegram", ProviderUserID: "tg-to", ProviderChatID: "tg-to",
-		Text: "thinking", ProviderMessageID: "to-1", ReceivedAt: time.Now(),
-	}
-	require.NoError(t, fx.relay.HandleInbound(context.Background(), msg))
-	sent := fx.tg.Snapshot()
-	require.Len(t, sent, 1)
-	assert.Contains(t, sent[0].Msg.Text, "still working")
 }
 
 // ---------------------------------------------------------------------------

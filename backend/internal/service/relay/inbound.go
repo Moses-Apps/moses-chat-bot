@@ -421,8 +421,8 @@ User's message:
 %s`, capitalize(msg.Provider), link.ID, link.ID, msg.Text)
 }
 
-// dispatchToMM resolves the per-chat conversation, subscribes to the WS,
-// fires the streaming chat request, aggregates events, and replies.
+// dispatchToMM resolves the per-chat conversation, relays the user's message
+// to Moses Manager via the synchronous chat call, and sends MM's reply back.
 func (i *Inbound) dispatchToMM(
 	ctx context.Context,
 	link *db.ChatRelayLink,
@@ -471,53 +471,18 @@ func (i *Inbound) dispatchToMM(
 	}
 	logger = logger.With(slog.String("conversation_id", conversationID.String()))
 
-	// What MM actually receives: the user's text wrapped with relay context
-	// (chat link id + how to push async follow-ups). Built once and used for
-	// both the streaming path and the sync fallback.
+	// What MM receives: the user's text wrapped with relay context (chat link
+	// id + how to push async follow-ups).
 	relayPrompt := buildRelayPrompt(link, msg)
 
-	// Subscribe BEFORE firing the stream so we don't lose early chunks.
-	sub, err := i.WSPool.Get(ctx, link.ID, bearer, conversationID)
-	if err != nil {
-		logger.Warn("ws subscribe failed; falling back to sync", slog.String("err", err.Error()))
-		return i.syncFallback(ctx, link, chatClient, conversationID, relayPrompt, "ws_subscribe_failed", logger)
-	}
-	i.WSPool.Touch(link.ID)
-
-	// Fire the stream request.
-	if _, err := chatClient.StreamChatMessage(ctx, mosesclient.ChatStreamOpts{
-		Message:        relayPrompt,
-		ConversationID: conversationID.String(),
-	}); err != nil {
-		if errors.Is(err, mosesclient.ErrUnauthorized) {
-			i.handleUnauthorized(ctx, link, logger)
-			return err
-		}
-		logger.Warn("stream rpc failed; falling back to sync", slog.String("err", err.Error()))
-		return i.syncFallback(ctx, link, chatClient, conversationID, relayPrompt, "stream_dispatch_failed", logger)
-	}
-
-	// Aggregate events.
-	aggregated, status, err := i.aggregateStream(ctx, sub, conversationID, logger)
-	if err != nil {
-		return err
-	}
-
-	switch status {
-	case streamStatusComplete:
-		_, err := i.Sender.SendToLink(ctx, link, provider.OutboundMessage{Text: aggregated}, &conversationID)
-		return err
-	case streamStatusTimeout:
-		_, err := i.Sender.SendToLink(ctx, link, provider.OutboundMessage{
-			Text: "Moses is still working on this — try again in a moment.",
-		}, &conversationID)
-		return err
-	case streamStatusDisconnected:
-		logger.Warn("ws disconnect mid-stream; switching to sync fallback")
-		return i.syncFallback(ctx, link, chatClient, conversationID, msg.Text, "ws_disconnected", logger)
-	default:
-		return fmt.Errorf("relay: unexpected stream status %q", status)
-	}
+	// Deliver via the synchronous chat call. The relay sends ONE final message
+	// per turn, so it only needs MM's complete reply text — streaming buys a
+	// chat provider nothing. The WS-aggregation path (aggregateStream) is kept
+	// in the package but is no longer on the hot path: it depended on a
+	// platform WS `assistant_message_complete` event that did not reliably
+	// arrive, which stranded every turn until the 5-minute StreamTimeout. The
+	// WebSocket delivery model is being re-planned separately.
+	return i.syncFallback(ctx, link, chatClient, conversationID, relayPrompt, "primary", logger)
 }
 
 type streamStatus string
