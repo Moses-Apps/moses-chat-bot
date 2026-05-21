@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-// DefaultTimeout is the per-request timeout for non-streaming methods.
-// Streaming methods (StreamChatMessage) bypass this and rely on
-// context cancellation instead, because Moses Manager runs can take
-// minutes.
+// DefaultTimeout is the per-request timeout for client HTTP calls.
+// StreamChatMessage is fire-and-forget — the platform acknowledges it
+// within milliseconds and then runs the Moses Manager turn in its own
+// background goroutine — so 30s is ample for every call the client makes.
 const DefaultTimeout = 30 * time.Second
 
 // Client is the typed wrapper. Construct with NewClient and reuse

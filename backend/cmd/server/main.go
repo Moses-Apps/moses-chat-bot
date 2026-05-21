@@ -1,8 +1,9 @@
 // Command server boots the moses-chat-bot HTTP service.
 //
 // Inbound relay: the Telegram adapter registers itself in the provider
-// registry and inbound messages drive the Moses Manager streaming bridge with
-// response chunks aggregated over a per-link WS subscription.
+// registry and inbound messages fire a Moses Manager streaming turn. The relay
+// does not harvest the reply — Moses Manager delivers its answer back to the
+// chat by calling the bot's `notifyLink` workspace tool.
 //
 // Inbound mode (moses-chat-bot-9so): by default the bot LONG-POLLS getUpdates —
 // a purely outbound model that needs no public URL and works behind the Moses
@@ -21,7 +22,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -91,17 +91,6 @@ func main() {
 	sender := relay.NewSender(store, providerRegistry, relay.SenderOpts{})
 	go sender.Bucket().Run(ctx)
 
-	// WS pool for the inbound relay: one persistent socket per linked user
-	// (the WS handshake URL embeds the user's MCP key, so we cannot share
-	// one connection across users). Idle conns reaped by RunSweeper every
-	// minute; per-link IdleTTL=10m.
-	wsPool := relay.NewWSConnPool(relay.WSPoolConfig{
-		BaseWS:  mosesBase,
-		IdleTTL: 10 * time.Minute,
-	})
-	go wsPool.RunSweeper(ctx, 1*time.Minute)
-	defer wsPool.Stop()
-
 	// ChatClientFactory builds a *mosesclient.Client carrying the bearer
 	// for one link's API key. Reuses the http.Client's default transport
 	// pool across factory invocations.
@@ -110,11 +99,8 @@ func main() {
 	}
 
 	inbound := relay.NewInbound(
-		store, sender, envelope, link, providerRegistry, chatFactory, wsPool,
-		relay.InboundOpts{
-			StreamTimeout: streamTimeoutFromEnv(),
-			Logger:        logger,
-		},
+		store, sender, envelope, link, providerRegistry, chatFactory,
+		relay.InboundOpts{Logger: logger},
 	)
 
 	// Autopilot service: per-user platform calls (Start/Stop/Status) plus a
@@ -252,20 +238,4 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"ok":true}`))
-}
-
-// streamTimeoutFromEnv reads CHAT_BOT_STREAM_TIMEOUT and parses it as a
-// Go duration. Default 5 minutes. Invalid values fall back silently with
-// a log message.
-func streamTimeoutFromEnv() time.Duration {
-	raw := strings.TrimSpace(os.Getenv("CHAT_BOT_STREAM_TIMEOUT"))
-	if raw == "" {
-		return 5 * time.Minute
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil {
-		log.Printf("invalid CHAT_BOT_STREAM_TIMEOUT %q; defaulting to 5m", raw)
-		return 5 * time.Minute
-	}
-	return d
 }

@@ -74,54 +74,30 @@ func TestE2E_NewUserLinks_FirstMessage_RoundTrip(t *testing.T) {
 	_, err = h.Store.GetPendingLinkByCode(h.Ctx, tenantID, codeOut.Code)
 	require.True(t, db.IsNoRows(err), "pending row should be consumed")
 
-	// Step 3: a regular inbound message goes through the streaming path.
-	// HandleInbound dials WS (via fake dialer), creates a conversation
-	// via the stubbed POST /chat/conversations, fires StreamChatMessage,
-	// aggregates WS chunks, and replies via the InMemoryProvider.
-	done := make(chan error, 1)
-	go func() {
-		done <- h.Inbound.HandleInbound(context.Background(), inboundMsg(providerUserID, "hello world", "tg-msg-1"))
-	}()
+	// Step 3: a regular inbound message fires a streaming MM turn.
+	// HandleInbound creates a conversation via the stubbed POST
+	// /chat/conversations, fires StreamChatMessage, and returns — it does
+	// NOT harvest a reply. MM would deliver its answer by calling the
+	// bot's notifyLink workspace tool (covered separately).
+	require.NoError(t, h.Inbound.HandleInbound(context.Background(),
+		inboundMsg(providerUserID, "hello world", "tg-msg-1")))
 
-	// Wait until the stub recorded a /ai/chat/stream call; that means
-	// the WS subscription and conversation creation are done.
-	eventually(t, func() bool {
-		return h.Backend.state.snapshot().streamCalls >= 1
-	}, 3*time.Second, "stream call did not fire")
+	// The platform recorded a /ai/chat/stream call carrying the user's
+	// text and the conversation id.
+	snap := h.Backend.state.snapshot()
+	require.GreaterOrEqual(t, snap.streamCalls, 1, "stream call did not fire")
+	require.NotEmpty(t, snap.lastStreamConv, "stream call should carry conversationId")
+	assert.Contains(t, snap.lastStreamMsg, "hello world", "the user's text must reach MM")
+	assert.Contains(t, snap.lastStreamMsg, "notifyLink", "MM must be told to deliver via notifyLink")
 
-	convStr := h.Backend.state.snapshot().lastStreamConv
-	require.NotEmpty(t, convStr, "stream call should carry conversationId")
-
-	// Drive WS events. Multi-chunk aggregation is the load-bearing
-	// behaviour here.
-	h.WS.pushChunk(t, convStr, "Hi! ")
-	h.WS.pushChunk(t, convStr, "How can I help ")
-	h.WS.pushChunk(t, convStr, "today?")
-	h.WS.pushComplete(t, convStr)
-
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("HandleInbound did not return after assistant_message_complete")
-	}
-
-	sent := h.Telegram.Snapshot()
-	require.Len(t, sent, 1)
-	assert.Equal(t, "Hi! How can I help today?", sent[0].Msg.Text)
-
-	// Outbound row inserted, conversation id stamped.
+	// The relay does NOT deliver the turn reply itself — nothing is sent
+	// to the provider and no outbound row is persisted on this path.
+	assert.Empty(t, h.Telegram.Snapshot(), "relay must not send a turn reply itself")
 	msgs, err := h.Store.ListRecentByLink(h.Ctx, link.ID, 10)
 	require.NoError(t, err)
-	hasOut := false
 	for _, m := range msgs {
-		if m.Direction == "out" {
-			hasOut = true
-			require.NotNil(t, m.MosesConversationID)
-			assert.Equal(t, "Hi! How can I help today?", m.Text)
-		}
+		assert.NotEqual(t, "out", m.Direction, "relay must not persist an outbound row for the turn")
 	}
-	assert.True(t, hasOut, "outbound row should be persisted")
 }
 
 // ---------------------------------------------------------------------------
@@ -382,46 +358,18 @@ func TestE2E_ConcurrentInbound_NoDupConversation(t *testing.T) {
 	providerUserID := "tg-concur"
 	link := h.completeLinkE2E(t, tenantID, mosesUserID, providerUserID, "mcp-user-concur")
 
-	// Fire two HandleInbound calls in parallel.
+	// Fire two HandleInbound calls in parallel. Each fires a streaming MM
+	// turn and returns — there is no reply to harvest.
 	var wg sync.WaitGroup
 	wg.Add(2)
-	for i, mid := range []string{"c-1", "c-2"} {
-		i, mid := i, mid
+	for _, mid := range []string{"c-1", "c-2"} {
+		mid := mid
 		go func() {
 			defer wg.Done()
 			_ = h.Inbound.HandleInbound(context.Background(),
 				inboundMsg(providerUserID, "msg "+mid, mid))
-			_ = i
 		}()
 	}
-
-	// Wait for at least one stream call so we know the WS dialer fired.
-	eventually(t, func() bool {
-		return h.Backend.state.snapshot().streamCalls >= 1
-	}, 3*time.Second, "no stream call observed")
-
-	// Drive each in-flight stream to completion. Push enough chunks/completes
-	// to cover both — the per-link WS subscriber serialises events but we
-	// only need one assistant_message_complete per HandleInbound invocation.
-	// We poll the conversation id we set on the chat-state row.
-	eventually(t, func() bool {
-		states, err := h.Store.ListByLink(h.Ctx, link.ID)
-		if err != nil || len(states) == 0 {
-			return false
-		}
-		return states[0].MosesConversationID != nil
-	}, 3*time.Second, "conversation id never persisted")
-
-	states, err := h.Store.ListByLink(h.Ctx, link.ID)
-	require.NoError(t, err)
-	require.Len(t, states, 1, "exactly one chat-state row per (link, chat)")
-	convStr := states[0].MosesConversationID.String()
-
-	// Push 2 complete-events so each in-flight HandleInbound goroutine
-	// unblocks. The fake subscriber is a FIFO buffer per link so order
-	// is fine.
-	h.WS.pushComplete(t, convStr)
-	h.WS.pushComplete(t, convStr)
 
 	doneCh := make(chan struct{})
 	go func() { wg.Wait(); close(doneCh) }()
@@ -431,8 +379,21 @@ func TestE2E_ConcurrentInbound_NoDupConversation(t *testing.T) {
 		t.Fatal("concurrent HandleInbound goroutines did not return")
 	}
 
-	// Both inbound rows must reference exactly one chat-state row's
-	// conversation id (asserted via single ListByLink row above).
+	// Exactly one chat-state row exists for (link, chat); both turns shared
+	// its conversation id.
+	states, err := h.Store.ListByLink(h.Ctx, link.ID)
+	require.NoError(t, err)
+	require.Len(t, states, 1, "exactly one chat-state row per (link, chat)")
+	require.NotNil(t, states[0].MosesConversationID, "conversation id persisted")
+	convStr := states[0].MosesConversationID.String()
+
+	// Both stream calls landed on the platform, both carrying that one
+	// conversation id.
+	snap := h.Backend.state.snapshot()
+	assert.GreaterOrEqual(t, snap.streamCalls, 2, "both turns fired a stream call")
+	assert.Equal(t, convStr, snap.lastStreamConv, "stream calls share the chat-state conversation id")
+
+	// Both inbound rows persisted; the relay sent no turn reply itself.
 	msgs, err := h.Store.ListRecentByLink(h.Ctx, link.ID, 50)
 	require.NoError(t, err)
 	inCount := 0
@@ -440,9 +401,9 @@ func TestE2E_ConcurrentInbound_NoDupConversation(t *testing.T) {
 		if m.Direction == "in" {
 			inCount++
 		}
+		assert.NotEqual(t, "out", m.Direction, "relay must not persist an outbound row for the turn")
 	}
 	assert.Equal(t, 2, inCount, "both inbound messages persisted")
-	assert.Equal(t, convStr, states[0].MosesConversationID.String())
 }
 
 // ---------------------------------------------------------------------------
@@ -600,50 +561,6 @@ func TestE2E_SlashCommands_CoverDispatch(t *testing.T) {
 	states, err := h.Store.ListByLink(h.Ctx, link.ID)
 	require.NoError(t, err)
 	require.Nil(t, states[0].MosesConversationID, "/clear should null the conversation pointer")
-}
-
-// TestE2E_SyncFallback_OnWSEventClose exercises dispatchToMM's degraded
-// path where the WS pushes a terminal error frame and the bot falls back
-// to POST /ai/chat. The unit-level test in inbound_test.go covers the
-// same branch; this E2E variant validates that the fallback ALSO lands
-// on the stubbed moses-backend's sync endpoint.
-func TestE2E_SyncFallback_OnWSEventClose(t *testing.T) {
-	h := newHarness(t)
-	tenantID := uuid.New()
-	mosesUserID := uuid.New()
-	providerUserID := "tg-sync"
-	_ = h.completeLinkE2E(t, tenantID, mosesUserID, providerUserID, "mcp-key-sync")
-
-	h.Backend.state.mu.Lock()
-	h.Backend.state.chatSyncMessage = "fallback OK"
-	h.Backend.state.mu.Unlock()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- h.Inbound.HandleInbound(context.Background(),
-			inboundMsg(providerUserID, "hi via sync", "sync-1"))
-	}()
-	eventually(t, func() bool {
-		return h.Backend.state.snapshot().streamCalls >= 1
-	}, 3*time.Second, "stream call did not fire")
-
-	convStr := h.Backend.state.snapshot().lastStreamConv
-	sub := h.WS.waitForConv(t, convStr, 2*time.Second)
-	// Push a terminal error → aggregateStream returns "disconnected" →
-	// dispatchToMM calls syncFallback.
-	sub.push(mosesclient.WSEvent{Type: "error"})
-
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("HandleInbound did not return after WS terminal error")
-	}
-
-	sent := h.Telegram.Snapshot()
-	require.GreaterOrEqual(t, len(sent), 1)
-	assert.Equal(t, "fallback OK", sent[len(sent)-1].Msg.Text)
-	assert.GreaterOrEqual(t, h.Backend.state.snapshot().syncCalls, 1)
 }
 
 // ---------------------------------------------------------------------------

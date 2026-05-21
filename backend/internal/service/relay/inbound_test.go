@@ -185,20 +185,21 @@ func (f *inboundFake) outbound() []insertedRow {
 // Fake mosesclient (per-key chat client)
 // ---------------------------------------------------------------------------
 
+// fakeChatClient stands in for a per-key *mosesclient.Client. The relay
+// invokes MM via StreamChatMessage (fire-and-forget) and never harvests a
+// reply, so the fake only records that the stream was fired.
 type fakeChatClient struct {
 	mu sync.Mutex
 
-	createErr    error
-	streamErr    error
-	syncErr      error
-	syncMessage  string
+	createErr error
+	streamErr error
 
-	createCalls  int
-	streamCalls  int
-	syncCalls    int
+	createCalls int
+	streamCalls int
 
-	lastBearer   string
-	lastConvID   string
+	lastBearer string
+	lastConvID string
+	lastStreamMsg string
 }
 
 func (c *fakeChatClient) CreateConversation(_ context.Context, _ mosesclient.CreateConversationOpts) (*mosesclient.Conversation, error) {
@@ -216,88 +217,11 @@ func (c *fakeChatClient) StreamChatMessage(_ context.Context, opts mosesclient.C
 	defer c.mu.Unlock()
 	c.streamCalls++
 	c.lastConvID = opts.ConversationID
+	c.lastStreamMsg = opts.Message
 	if c.streamErr != nil {
 		return nil, c.streamErr
 	}
 	return &mosesclient.ChatStreamAck{Status: "processing", ConversationID: opts.ConversationID}, nil
-}
-
-func (c *fakeChatClient) SendChatMessageSync(_ context.Context, opts mosesclient.ChatSyncOpts) (*mosesclient.ChatSyncResponse, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.syncCalls++
-	c.lastConvID = opts.ConversationID
-	if c.syncErr != nil {
-		return nil, c.syncErr
-	}
-	return &mosesclient.ChatSyncResponse{Message: c.syncMessage, Role: "assistant"}, nil
-}
-
-// ---------------------------------------------------------------------------
-// Fake Subscriber
-// ---------------------------------------------------------------------------
-
-type fakeSubscriber struct {
-	mu       sync.Mutex
-	events   chan mosesclient.WSEvent
-	subs     []string
-	subErr   error
-	closed   bool
-}
-
-func newFakeSubscriber(buffer int) *fakeSubscriber {
-	return &fakeSubscriber{events: make(chan mosesclient.WSEvent, buffer)}
-}
-
-func (s *fakeSubscriber) Subscribe(_, topicID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.subErr != nil {
-		return s.subErr
-	}
-	s.subs = append(s.subs, topicID)
-	return nil
-}
-
-func (s *fakeSubscriber) Events() <-chan mosesclient.WSEvent { return s.events }
-func (s *fakeSubscriber) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.closed {
-		s.closed = true
-		close(s.events)
-	}
-	return nil
-}
-
-func (s *fakeSubscriber) push(ev mosesclient.WSEvent) {
-	s.events <- ev
-}
-
-// dialerReturning builds a WSDialer that yields the given subscriber. The
-// dialer captures the requested bearer for assertions.
-type capturedDial struct {
-	mu     sync.Mutex
-	bearer string
-	called int
-}
-
-func (c *capturedDial) snapshot() (string, int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.bearer, c.called
-}
-
-func dialerReturning(sub Subscriber, cd *capturedDial) WSDialer {
-	return func(_ context.Context, _, token string, _ mosesclient.WSConfig) (Subscriber, error) {
-		if cd != nil {
-			cd.mu.Lock()
-			cd.bearer = token
-			cd.called++
-			cd.mu.Unlock()
-		}
-		return sub, nil
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -311,9 +235,7 @@ type inboundFixture struct {
 	tg       *providertest.InMemoryProvider
 	relay    *Inbound
 	chat     *fakeChatClient
-	pool     *wsConnPool
 	envelope *cryptoStub
-	sub      *fakeSubscriber
 }
 
 // cryptoStub bypasses the real envelope so tests don't need a master key.
@@ -336,7 +258,7 @@ func newTestEnvelopeForRelay(t *testing.T) *cryptoEnvelope {
 	return newCryptoEnvelope(t)
 }
 
-func newFixture(t *testing.T, subscriber *fakeSubscriber) *inboundFixture {
+func newFixture(t *testing.T) *inboundFixture {
 	t.Helper()
 	store := newInboundFake()
 	tg := providertest.NewInMemoryProvider("telegram")
@@ -348,15 +270,7 @@ func newFixture(t *testing.T, subscriber *fakeSubscriber) *inboundFixture {
 	// HandleInbound only invokes the linker for /unlink and RegisterKnown,
 	// so passing nil here works as long as those paths aren't exercised.
 	// Tests that do exercise unlink wire a separate testcontainer fixture.
-	// For minimal in-memory tests we substitute via the dedicated
-	// linkerSubstitute helper.
 	link := newOfflineLinker(t, env)
-
-	cd := &capturedDial{}
-	pool := NewWSConnPool(WSPoolConfig{
-		BaseWS: "http://moses-backend.test",
-		Dialer: dialerReturning(subscriber, cd),
-	})
 
 	sender := NewSender(adaptInboundFakeToSenderStore(store), reg, SenderOpts{})
 
@@ -369,15 +283,12 @@ func newFixture(t *testing.T, subscriber *fakeSubscriber) *inboundFixture {
 			chat.mu.Unlock()
 			return chat
 		},
-		pool,
 		InboundOpts{
-			StreamTimeout: 500 * time.Millisecond,
-			Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		},
 	)
 	return &inboundFixture{
-		store: store, sender: sender, tg: tg, relay: relay,
-		chat: chat, pool: pool, sub: subscriber,
+		store: store, sender: sender, tg: tg, relay: relay, chat: chat,
 	}
 }
 
@@ -399,7 +310,7 @@ func adaptInboundFakeToSenderStore(f *inboundFake) Store {
 // ---------------------------------------------------------------------------
 
 func TestHandleInbound_NoLinkedUser_RepliesLinkInstructions(t *testing.T) {
-	fx := newFixture(t, newFakeSubscriber(8))
+	fx := newFixture(t)
 	msg := provider.InboundMessage{
 		Provider:          "telegram",
 		ProviderUserID:    "tg-unknown",
@@ -417,7 +328,7 @@ func TestHandleInbound_NoLinkedUser_RepliesLinkInstructions(t *testing.T) {
 }
 
 func TestHandleInbound_Duplicate_Skipped(t *testing.T) {
-	fx := newFixture(t, newFakeSubscriber(8))
+	fx := newFixture(t)
 	link := seedLink(fx, "telegram", "tg-1")
 	msg := provider.InboundMessage{
 		Provider: "telegram", ProviderUserID: "tg-1", ProviderChatID: "tg-1",
@@ -445,7 +356,7 @@ func TestHandleInbound_Duplicate_Skipped(t *testing.T) {
 }
 
 func TestHandleInbound_SlashStart_RegistersKnown(t *testing.T) {
-	fx := newFixture(t, newFakeSubscriber(8))
+	fx := newFixture(t)
 	seedLink(fx, "telegram", "tg-start")
 	require.False(t, fx.relay.Linker.IsKnown("telegram", "tg-start"))
 
@@ -463,7 +374,7 @@ func TestHandleInbound_SlashStart_RegistersKnown(t *testing.T) {
 func TestHandleInbound_SlashLink_AlreadyLinked_Replies(t *testing.T) {
 	// /link sent by someone whose provider_user_id is already actively linked
 	// returns the already-linked message; we don't burn a lockout strike.
-	fx := newFixture(t, newFakeSubscriber(8))
+	fx := newFixture(t)
 	seedLink(fx, "telegram", "tg-link-1")
 	fx.relay.Linker.RegisterKnown("telegram", "tg-link-1")
 
@@ -481,7 +392,7 @@ func TestHandleInbound_SlashStart_Unlinked_RegistersAndWelcomes(t *testing.T) {
 	// Regression: a user with NO link sends /start. The link-resolution gate
 	// used to return before command dispatch, so /start never ran. It must
 	// now register the user as known and reply with the welcome.
-	fx := newFixture(t, newFakeSubscriber(8))
+	fx := newFixture(t)
 	require.False(t, fx.relay.Linker.IsKnown("telegram", "tg-new"))
 
 	msg := provider.InboundMessage{
@@ -502,7 +413,7 @@ func TestHandleInbound_SlashLink_Unlinked_ReachesLinker(t *testing.T) {
 	// not known (no /start), so CompleteLink returns ErrUnknownUser, which
 	// the relay surfaces as a "send /start first" reply — proving /link is
 	// now dispatched for unlinked users.
-	fx := newFixture(t, newFakeSubscriber(8))
+	fx := newFixture(t)
 
 	msg := provider.InboundMessage{
 		Provider: "telegram", ProviderUserID: "tg-nolink", ProviderChatID: "tg-nolink",
@@ -523,7 +434,7 @@ func TestHandleInbound_SlashLink_Unlinked_ReachesLinker(t *testing.T) {
 // path replies "not configured" — a reply only dispatchCommand produces,
 // proving the message was NOT relayed to MM.
 func TestHandleInbound_AutopilotMixedCase_HandledAsCommand(t *testing.T) {
-	fx := newFixture(t, newFakeSubscriber(8))
+	fx := newFixture(t)
 	seedLink(fx, "telegram", "tg-ap")
 
 	msg := provider.InboundMessage{
@@ -538,7 +449,7 @@ func TestHandleInbound_AutopilotMixedCase_HandledAsCommand(t *testing.T) {
 }
 
 func TestHandleInbound_SlashClear_ResetsConversation(t *testing.T) {
-	fx := newFixture(t, newFakeSubscriber(8))
+	fx := newFixture(t)
 	link := seedLink(fx, "telegram", "tg-clear")
 	// Pre-seed a chat-state with a conversation id.
 	_, err := fx.store.GetOrCreate(context.Background(), link.ID, "tg-clear")
@@ -557,10 +468,15 @@ func TestHandleInbound_SlashClear_ResetsConversation(t *testing.T) {
 	assert.Nil(t, state.MosesConversationID, "/clear should null the conversation pointer")
 }
 
-func TestHandleInbound_RegularMessage_DeliversViaSync(t *testing.T) {
-	fx := newFixture(t, newFakeSubscriber(1))
-	link := seedLink(fx, "telegram", "tg-mm")
-	fx.chat.syncMessage = "Hello world!"
+// TestHandleInbound_RegularMessage_FiresStreamNoHarvest pins the reworked
+// delivery model: a regular message fires the streaming MM invocation and
+// HandleInbound returns WITHOUT harvesting a reply. MM is expected to deliver
+// its answer asynchronously by calling the notifyLink workspace tool, so the
+// relay sends nothing to the provider on this path and persists no outbound
+// row of its own.
+func TestHandleInbound_RegularMessage_FiresStreamNoHarvest(t *testing.T) {
+	fx := newFixture(t)
+	seedLink(fx, "telegram", "tg-mm")
 
 	msg := provider.InboundMessage{
 		Provider: "telegram", ProviderUserID: "tg-mm", ProviderChatID: "tg-mm",
@@ -568,25 +484,23 @@ func TestHandleInbound_RegularMessage_DeliversViaSync(t *testing.T) {
 	}
 	require.NoError(t, fx.relay.HandleInbound(context.Background(), msg))
 
-	// MM's reply is fetched via the synchronous chat call and relayed as one
-	// Telegram message.
+	// The streaming turn was fired; no synchronous harvest happens.
 	fx.chat.mu.Lock()
-	assert.GreaterOrEqual(t, fx.chat.syncCalls, 1, "expected the synchronous chat path")
+	assert.GreaterOrEqual(t, fx.chat.streamCalls, 1, "expected the streaming chat path to fire")
+	assert.NotEmpty(t, fx.chat.lastConvID, "stream call must carry a conversation id")
+	assert.Contains(t, fx.chat.lastStreamMsg, "say hi", "the user's text must reach MM")
+	assert.Contains(t, fx.chat.lastStreamMsg, "notifyLink", "the relay prompt must instruct MM to deliver via notifyLink")
 	fx.chat.mu.Unlock()
 
-	sent := fx.tg.Snapshot()
-	require.Len(t, sent, 1)
-	assert.Equal(t, "Hello world!", sent[0].Msg.Text)
-
-	// Outbound row persisted with the conversation id.
-	out := fx.store.outbound()
-	require.Len(t, out, 1)
-	require.NotNil(t, out[0].MosesConversationID)
-	_ = link
+	// The relay does NOT deliver the turn reply itself — MM pushes via
+	// notifyLink. So nothing was sent to the provider and no outbound row
+	// was persisted on this path.
+	assert.Empty(t, fx.tg.Snapshot(), "relay must not send a turn reply itself")
+	assert.Empty(t, fx.store.outbound(), "relay must not persist an outbound row for the turn")
 }
 
 func TestHandleInbound_401_DeactivatesLink_NotifiesUser(t *testing.T) {
-	fx := newFixture(t, newFakeSubscriber(8))
+	fx := newFixture(t)
 	link := seedLink(fx, "telegram", "tg-401")
 	fx.chat.createErr = mosesclient.ErrUnauthorized
 
@@ -646,9 +560,9 @@ func init() {
 }
 
 // TestBuildRelayPrompt pins the relay-context contract: Moses Manager must
-// receive the user's text, the chat link id to address async follow-ups to,
-// a pointer at the notifyLink workspace tool, and the do-not-double-post
-// instruction for the immediate reply.
+// receive the user's text, the chat link id, and an unambiguous instruction
+// that it MUST deliver its reply itself via the notifyLink workspace tool
+// (the relay no longer auto-delivers the turn reply).
 func TestBuildRelayPrompt(t *testing.T) {
 	link := &db.ChatRelayLink{ID: uuid.New()}
 	msg := provider.InboundMessage{Provider: "telegram", Text: "deploy my app please"}
@@ -658,6 +572,6 @@ func TestBuildRelayPrompt(t *testing.T) {
 	assert.Contains(t, got, "deploy my app please", "user's actual text must be relayed")
 	assert.Contains(t, got, link.ID.String(), "MM must know which chat (link id) to address")
 	assert.Contains(t, got, "notifyLink", "MM must be pointed at the notifyLink workspace tool")
-	assert.Contains(t, got, "twice", "MM must be told not to tool-send its immediate reply")
+	assert.Contains(t, got, "MUST", "MM must be told it MUST deliver its reply via notifyLink")
 	assert.Contains(t, got, "Telegram", "provider name should be surfaced, capitalized")
 }

@@ -2,8 +2,12 @@
 // moses-chat-bot backend. It wires the real *db.Store (testcontainer or
 // TEST_DATABASE_URL Postgres), the real linker / autopilot / relay services,
 // a stubbed Telegram provider (providertest.InMemoryProvider), and a stubbed
-// moses-backend (httptest server impersonating the platform's HTTP + WS
-// surface).
+// moses-backend (httptest server impersonating the platform's HTTP surface).
+//
+// Delivery model: the relay fires a streaming MM turn (POST /ai/chat/stream)
+// and does NOT harvest the reply — MM would deliver its answer by calling the
+// bot's notifyLink workspace tool. These tests therefore assert that the turn
+// is *invoked*, not that a reply is relayed back.
 //
 // Scenarios live in e2e_test.go. The harness here only sets up shared state.
 //
@@ -20,8 +24,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -30,7 +32,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -177,7 +178,6 @@ type mockState struct {
 
 	// Chat / streaming
 	chatStreamStatus int // returned on POST /ai/chat/stream; 0 = 200
-	chatSyncMessage  string
 
 	// Conversations
 	createConversationStatus int
@@ -192,7 +192,6 @@ type mockState struct {
 
 	// Recorded calls (for assertions)
 	streamCalls         int
-	syncCalls           int
 	createConvCalls     int
 	startAutoCalls      int
 	stopAutoCalls       int
@@ -209,7 +208,6 @@ type mockState struct {
 type stateSnapshot struct {
 	mintCount         int
 	streamCalls       int
-	syncCalls         int
 	createConvCalls   int
 	startAutoCalls    int
 	stopAutoCalls     int
@@ -224,7 +222,6 @@ func (m *mockState) snapshot() stateSnapshot {
 	return stateSnapshot{
 		mintCount:         m.mintCount,
 		streamCalls:       m.streamCalls,
-		syncCalls:         m.syncCalls,
 		createConvCalls:   m.createConvCalls,
 		startAutoCalls:    m.startAutoCalls,
 		stopAutoCalls:     m.stopAutoCalls,
@@ -234,16 +231,14 @@ func (m *mockState) snapshot() stateSnapshot {
 	}
 }
 
-// newMosesBackendStub builds the fake HTTP server. The WS endpoint is mounted
-// on a SEPARATE httptest.Server (see newMosesWSStub) because the bot wires
-// WSPool with the dialer baseURL; we use the same base URL for HTTP and WS
-// by combining via mux.
+// newMosesBackendStub builds the fake HTTP server impersonating the platform
+// surface the bot calls into (conversations, streaming chat invocation,
+// autonomous sessions, key mint/revoke).
 func newMosesBackendStub(t *testing.T) *mosesBackendStub {
 	t.Helper()
 	state := &mockState{
-		mintKeyID:    uuid.New(),
-		mintKey:      "mcp-test-" + uuid.NewString(),
-		chatSyncMessage: "sync fallback reply",
+		mintKeyID: uuid.New(),
+		mintKey:   "mcp-test-" + uuid.NewString(),
 	}
 	stub := &mosesBackendStub{state: state}
 
@@ -320,19 +315,6 @@ func newMosesBackendStub(t *testing.T) *mosesBackendStub {
 		_ = json.NewEncoder(w).Encode(mosesclient.ChatStreamAck{
 			Status:         "processing",
 			ConversationID: body.ConversationID,
-		})
-	})
-
-	// POST /api/v1/ai/chat — sync fallback
-	mux.HandleFunc("POST /api/v1/ai/chat", func(w http.ResponseWriter, _ *http.Request) {
-		state.mu.Lock()
-		state.syncCalls++
-		msg := state.chatSyncMessage
-		state.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(mosesclient.ChatSyncResponse{
-			Message: msg,
-			Role:    "assistant",
 		})
 	})
 
@@ -420,158 +402,6 @@ func (s *mosesBackendStub) URL() string {
 }
 
 // ---------------------------------------------------------------------------
-// Fake WS subscriber (controlled by the harness)
-// ---------------------------------------------------------------------------
-
-// fakeWSSubscriber lets a test push WS events into the inbound aggregator.
-// One instance per (link.ID, conversation) is created on demand by the
-// dialer wrapper below.
-type fakeWSSubscriber struct {
-	mu        sync.Mutex
-	events    chan mosesclient.WSEvent
-	closed    bool
-	subscribed map[string]bool
-}
-
-func newFakeWSSubscriber(buffer int) *fakeWSSubscriber {
-	if buffer <= 0 {
-		buffer = 16
-	}
-	return &fakeWSSubscriber{
-		events:     make(chan mosesclient.WSEvent, buffer),
-		subscribed: make(map[string]bool),
-	}
-}
-
-func (s *fakeWSSubscriber) Subscribe(_, topicID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.subscribed[topicID] = true
-	return nil
-}
-
-func (s *fakeWSSubscriber) Events() <-chan mosesclient.WSEvent { return s.events }
-
-func (s *fakeWSSubscriber) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.closed {
-		s.closed = true
-		close(s.events)
-	}
-	return nil
-}
-
-func (s *fakeWSSubscriber) push(ev mosesclient.WSEvent) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
-	s.mu.Unlock()
-	s.events <- ev
-}
-
-// wsRouter holds per-bearer fake subscribers so the harness can route
-// pushes to the right link. Production calls Dial once per link with the
-// link's bearer token — the router returns (and remembers) one subscriber
-// per bearer string.
-type wsRouter struct {
-	mu  sync.Mutex
-	byBearer map[string]*fakeWSSubscriber
-	byConv   map[string]*fakeWSSubscriber
-	lastBearer atomic.Value // string — for tests that just want the latest
-}
-
-func newWSRouter() *wsRouter {
-	return &wsRouter{
-		byBearer: map[string]*fakeWSSubscriber{},
-		byConv:   map[string]*fakeWSSubscriber{},
-	}
-}
-
-// dialer returns a relay.WSDialer that lazily creates a fakeWSSubscriber
-// per bearer and remembers it for the test's pushEvent helper.
-func (r *wsRouter) dialer() relay.WSDialer {
-	return func(_ context.Context, _ string, token string, _ mosesclient.WSConfig) (relay.Subscriber, error) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		if sub, ok := r.byBearer[token]; ok {
-			return sub, nil
-		}
-		sub := newFakeWSSubscriber(32)
-		r.byBearer[token] = sub
-		r.lastBearer.Store(token)
-		return sub, nil
-	}
-}
-
-// rememberConv tags the subscriber with a conversation id so subsequent
-// pushes can be addressed by conversation rather than by bearer (more
-// natural for tests that don't know the bearer string).
-func (r *wsRouter) rememberConv(bearer, conv string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if sub, ok := r.byBearer[bearer]; ok {
-		r.byConv[conv] = sub
-	}
-}
-
-func (r *wsRouter) subscriberForConv(conv string) *fakeWSSubscriber {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.byConv[conv]
-}
-
-func (r *wsRouter) subscriberForBearer(bearer string) *fakeWSSubscriber {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.byBearer[bearer]
-}
-
-// pushChunk pushes an assistant_message_chunk into the subscriber that
-// matches the conversation id. Eventually-polls for up to 2s for the
-// subscriber to exist (the bot dials on first chat).
-func (r *wsRouter) pushChunk(t *testing.T, convStr, text string) {
-	t.Helper()
-	sub := r.waitForConv(t, convStr, 2*time.Second)
-	sub.push(mosesclient.WSEvent{
-		Type:           "assistant_message_chunk",
-		ConversationID: convStr,
-		Message:        []byte(fmt.Sprintf(`{"content":%q}`, text)),
-	})
-}
-
-func (r *wsRouter) pushComplete(t *testing.T, convStr string) {
-	t.Helper()
-	sub := r.waitForConv(t, convStr, 2*time.Second)
-	sub.push(mosesclient.WSEvent{
-		Type:           "assistant_message_complete",
-		ConversationID: convStr,
-	})
-}
-
-func (r *wsRouter) waitForConv(t *testing.T, conv string, timeout time.Duration) *fakeWSSubscriber {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if sub := r.subscriberForConv(conv); sub != nil {
-			return sub
-		}
-		// Also try mapping latest bearer → conv lazily.
-		if bearer, ok := r.lastBearer.Load().(string); ok && bearer != "" {
-			if sub := r.subscriberForBearer(bearer); sub != nil {
-				r.rememberConv(bearer, conv)
-				return sub
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("no WS subscriber appeared for conversation %s within %s", conv, timeout)
-	return nil
-}
-
-// ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
@@ -588,21 +418,13 @@ type Harness struct {
 	Linker        *linker.Linker
 	Autopilot     *autopilot.Service
 	Inbound       *relay.Inbound
-	WSPool        relayWSPool
 	Backend       *mosesBackendStub
-	WS            *wsRouter
 	LinksHandler  *handler.Links
 	PushHandler   *handler.Push
 
 	// HTTP servers (started lazily by the helper getters)
 	linksSrv *httptest.Server
 	pushSrv  *httptest.Server
-}
-
-// relayWSPool is a minimal interface so the harness can expose just enough
-// of the pool to tests without re-exporting the internal struct.
-type relayWSPool interface {
-	Stop()
 }
 
 // newHarness builds a fully-wired test fixture. Each test resets the DB
@@ -619,7 +441,6 @@ func newHarness(t *testing.T) *Harness {
 	require.NoError(t, registry.Register(tg))
 
 	backend := newMosesBackendStub(t)
-	wsRouter := newWSRouter()
 
 	// linker needs a mosesclient pointed at the stub so RevokeAPIKey (best
 	// effort on /unlink) lands on the stub's DELETE handler.
@@ -632,19 +453,6 @@ func newHarness(t *testing.T) *Harness {
 		PerLinkPerMinute: 50,
 	})
 
-	wsPool := relay.NewWSConnPool(relay.WSPoolConfig{
-		BaseWS:  backend.URL(),
-		IdleTTL: 5 * time.Minute,
-		Dialer:  wsRouter.dialer(),
-		SubscriberConfig: mosesclient.WSConfig{
-			HandshakeTimeout: 100 * time.Millisecond,
-			MaxRetries:       1,
-			BackoffBase:      10 * time.Millisecond,
-			BackoffCap:       100 * time.Millisecond,
-			EventBuffer:      32,
-		},
-	})
-
 	chatFactory := func(bearer string) relay.PerKeyChatClient {
 		return mosesclient.NewClient(backend.URL(), mosesclient.BearerAuth{Token: bearer})
 	}
@@ -652,11 +460,8 @@ func newHarness(t *testing.T) *Harness {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	inbound := relay.NewInbound(
-		store, sender, env, lk, registry, chatFactory, wsPool,
-		relay.InboundOpts{
-			StreamTimeout: 2 * time.Second,
-			Logger:        logger,
-		},
+		store, sender, env, lk, registry, chatFactory,
+		relay.InboundOpts{Logger: logger},
 	)
 
 	autopilotFactory := func(bearer string) autopilot.MosesClient {
@@ -678,15 +483,12 @@ func newHarness(t *testing.T) *Harness {
 		Linker:       lk,
 		Autopilot:    autoSvc,
 		Inbound:      inbound,
-		WSPool:       wsPool,
 		Backend:      backend,
-		WS:           wsRouter,
 		LinksHandler: handler.NewLinks(lk, store),
 		PushHandler:  handler.NewPush(store, sender),
 	}
 	t.Cleanup(func() {
 		cancel()
-		wsPool.Stop()
 	})
 	return h
 }
@@ -853,10 +655,3 @@ func urlPath(base, p string, query map[string]string) string {
 	u.RawQuery = q.Encode()
 	return u.String()
 }
-
-// silence unused imports that would otherwise show up depending on which
-// scenarios end up compiled in.
-var (
-	_ = errors.New
-	_ = io.Discard
-)

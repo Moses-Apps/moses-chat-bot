@@ -3,7 +3,6 @@ package mosesclient
 import (
 	"context"
 	"net/http"
-	"time"
 )
 
 // ChatStreamOpts is the request shape POSTed to
@@ -39,17 +38,20 @@ type ChatStreamAck struct {
 
 // StreamChatMessage triggers a Moses Manager run.
 //
-// IMPORTANT: this method returns as soon as the platform acknowledges
-// the request (HTTP 200, normally within milliseconds). The actual
-// assistant output flows back over the WebSocket
-// (/api/v1/ai/ws?token=...) as assistant_message_chunk events that
-// the caller aggregates via WSSubscriber.
+// This is a fire-and-forget invocation: the method returns as soon as
+// the platform acknowledges the request (HTTP 200, normally within
+// milliseconds — see ChatStreamAck). The platform then runs the agentic
+// loop in a server-side background goroutine on its own context, fully
+// decoupled from this HTTP connection (ai_chat_handlers.go
+// StreamChatMessage → processChatInBackground). The turn therefore runs
+// to completion even though the caller consumes no stream and may
+// disconnect immediately.
 //
-// The caller is responsible for subscribing to the conversation
-// BEFORE calling this method, to avoid losing early chunks. The
-// platform also pre-subscribes the user's existing WS connections via
-// AIHandler.StreamChatMessage → wsHandler.SubscribeUserToConversation
-// (ai_chat_handlers.go:425) as defence-in-depth.
+// The chat-bot relay relies on exactly that: it fires this to start a
+// turn and never harvests output — Moses Manager delivers its reply by
+// calling the chat-bot's `notifyLink` workspace tool. The streaming
+// path is also the only path that routes Anthropic OAuth subscriptions;
+// the synchronous /api/v1/ai/chat path 500s for them (CHAT-6j4in).
 func (c *Client) StreamChatMessage(ctx context.Context, opts ChatStreamOpts) (*ChatStreamAck, error) {
 	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/ai/chat/stream", opts)
 	if err != nil {
@@ -60,38 +62,4 @@ func (c *Client) StreamChatMessage(ctx context.Context, opts ChatStreamOpts) (*C
 		return nil, err
 	}
 	return &ack, nil
-}
-
-// ChatSyncOpts is the request shape POSTed to /api/v1/ai/chat (the
-// non-streaming fallback). Same fields as ChatStreamOpts.
-type ChatSyncOpts = ChatStreamOpts
-
-// ChatSyncResponse mirrors types.ChatMessageResponse on the platform
-// side: the full assistant turn returned synchronously when streaming
-// is unavailable. Used as a degraded-mode fallback when the bot
-// cannot hold a WebSocket open.
-type ChatSyncResponse struct {
-	Message     string    `json:"message"`
-	Role        string    `json:"role"`
-	Provider    string    `json:"provider,omitempty"`
-	Model       string    `json:"model,omitempty"`
-	Timestamp   string    `json:"timestamp,omitempty"`
-	ReceivedAt  time.Time `json:"-"` // client-side stamp for latency tracking
-	ToolCalls   int       `json:"tool_calls,omitempty"`
-}
-
-// SendChatMessageSync calls POST /api/v1/ai/chat and waits for the
-// complete assistant turn. Use only when streaming is unavailable —
-// long agentic loops may exceed DefaultTimeout (30s).
-func (c *Client) SendChatMessageSync(ctx context.Context, opts ChatSyncOpts) (*ChatSyncResponse, error) {
-	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/ai/chat", opts)
-	if err != nil {
-		return nil, err
-	}
-	var resp ChatSyncResponse
-	if err := c.doJSON(req, &resp); err != nil {
-		return nil, err
-	}
-	resp.ReceivedAt = time.Now()
-	return &resp, nil
 }

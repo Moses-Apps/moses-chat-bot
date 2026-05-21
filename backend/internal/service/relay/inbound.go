@@ -1,14 +1,20 @@
 // Inbound is the message dispatch path: provider webhook → Moses Manager
 // → response back through the provider. The Sender (outbound.go) handles
-// the egress half; this file owns command dispatch, conversation
-// resolution, WS subscription, and stream aggregation.
+// the egress half; this file owns command dispatch and conversation
+// resolution.
+//
+// Delivery model: the relay fires the streaming chat invocation
+// (StreamChatMessage) to kick off a Moses Manager turn and then returns —
+// it does NOT harvest the reply. The streaming path is what routes every
+// AI-provider type, including Anthropic OAuth subscriptions, which the
+// synchronous /api/v1/ai/chat path structurally cannot serve (CHAT-6j4in).
+// MM delivers its answer back to the chat by calling the `notifyLink`
+// workspace tool (POST /api/v1/workspace/links/{id}/notify → Push →
+// Sender.SendToLink → Telegram); buildRelayPrompt instructs it to do so.
 //
 // Concurrency model: HandleInbound is safe to invoke from many goroutines
-// at once. The wsConnPool serialises per-link connection setup. The
-// WS event loop for any given (link, conversation) runs inline inside
-// HandleInbound; aggregated chunks for the same conversation arriving
-// concurrently are unspecified (Telegram serialises a 1:1 chat by
-// design so this doesn't happen in practice).
+// at once. Telegram serialises a 1:1 chat by design, so concurrent turns
+// for the same link do not happen in practice.
 package relay
 
 import (
@@ -69,10 +75,16 @@ var _ InboundStore = (*db.Store)(nil)
 // PerKeyChatClient builds an authenticated mosesclient for a single
 // user's bearer key. Different links carry different keys, so we cannot
 // reuse one client across users — but we DO reuse the underlying *http.Client.
+//
+// The relay invokes MM via StreamChatMessage only: that fire-and-forget
+// POST returns once the platform has accepted the turn (the turn then runs
+// in a server-side background goroutine on context.Background, decoupled
+// from the HTTP connection — see ai_chat_handlers.go StreamChatMessage).
+// The streaming path routes every provider type including OAuth
+// subscriptions; the synchronous path cannot (CHAT-6j4in).
 type PerKeyChatClient interface {
 	CreateConversation(ctx context.Context, opts mosesclient.CreateConversationOpts) (*mosesclient.Conversation, error)
 	StreamChatMessage(ctx context.Context, opts mosesclient.ChatStreamOpts) (*mosesclient.ChatStreamAck, error)
-	SendChatMessageSync(ctx context.Context, opts mosesclient.ChatSyncOpts) (*mosesclient.ChatSyncResponse, error)
 }
 
 // ChatClientFactory returns a PerKeyChatClient configured to authenticate
@@ -82,11 +94,6 @@ type ChatClientFactory func(bearer string) PerKeyChatClient
 
 // InboundOpts configures the Inbound service.
 type InboundOpts struct {
-	// StreamTimeout caps how long HandleInbound waits for
-	// assistant_message_complete on the WS before sending the user a
-	// retry message. Default 5min.
-	StreamTimeout time.Duration
-
 	// MaxConcurrent caps in-flight HandleInbound goroutines. The webhook
 	// handler enforces the semaphore upstream; setting it here is
 	// informational. Default 32.
@@ -99,15 +106,13 @@ type InboundOpts struct {
 
 // Inbound is the inbound dispatch service.
 type Inbound struct {
-	Store         InboundStore
-	Sender        *Sender
-	Envelope      *crypto.Envelope
-	Linker        *linker.Linker
-	Registry      *provider.Registry
-	ChatFactory   ChatClientFactory
-	WSPool        *wsConnPool
-	StreamTimeout time.Duration
-	Logger        *slog.Logger
+	Store       InboundStore
+	Sender      *Sender
+	Envelope    *crypto.Envelope
+	Linker      *linker.Linker
+	Registry    *provider.Registry
+	ChatFactory ChatClientFactory
+	Logger      *slog.Logger
 
 	// Autopilot is optional — when nil the /autopilot command surface
 	// degrades to a "not configured" reply. main.go wires this; tests
@@ -115,8 +120,8 @@ type Inbound struct {
 	Autopilot AutopilotService
 }
 
-// NewInbound constructs the inbound service. ChatFactory and WSPool are
-// required for production; tests inject fakes to avoid network I/O.
+// NewInbound constructs the inbound service. ChatFactory is required for
+// production; tests inject a fake to avoid network I/O.
 func NewInbound(
 	store InboundStore,
 	sender *Sender,
@@ -124,26 +129,20 @@ func NewInbound(
 	link *linker.Linker,
 	registry *provider.Registry,
 	chatFactory ChatClientFactory,
-	wsPool *wsConnPool,
 	opts InboundOpts,
 ) *Inbound {
-	if opts.StreamTimeout <= 0 {
-		opts.StreamTimeout = 5 * time.Minute
-	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Inbound{
-		Store:         store,
-		Sender:        sender,
-		Envelope:      env,
-		Linker:        link,
-		Registry:      registry,
-		ChatFactory:   chatFactory,
-		WSPool:        wsPool,
-		StreamTimeout: opts.StreamTimeout,
-		Logger:        logger,
+		Store:       store,
+		Sender:      sender,
+		Envelope:    env,
+		Linker:      link,
+		Registry:    registry,
+		ChatFactory: chatFactory,
+		Logger:      logger,
 	}
 }
 
@@ -398,31 +397,41 @@ func (i *Inbound) replyText(ctx context.Context, link *db.ChatRelayLink, text st
 }
 
 // buildRelayPrompt wraps the user's provider-chat message with relay context
-// for Moses Manager. It tells MM (a) the turn reply is delivered back to the
-// chat automatically so it should just answer normally, and (b) how to send
-// asynchronous follow-up messages to this SAME chat after the turn ends —
-// via the chat-bot app's `notifyLink` workspace tool, keyed by this link's
-// ID — for work that outlives the turn (deployments, autopilot runs, long
-// tasks). Without the link ID, MM has no way to address the chat for a
-// later push; without the instruction, it does not know the surface exists.
+// for Moses Manager. The relay does NOT auto-deliver this turn's reply — it
+// only invokes MM and returns. MM is therefore instructed to send its answer
+// (and any later progress) back to this chat itself by calling the chat-bot
+// app's `notifyLink` workspace tool, keyed by this link's ID. Without the
+// link ID, MM has no way to address the chat; without the instruction, it
+// does not know the surface exists or that it must use it.
 func buildRelayPrompt(link *db.ChatRelayLink, msg provider.InboundMessage) string {
 	return fmt.Sprintf(`[moses-chat-bot relay context]
-This message was relayed from a %s chat. Your reply to this turn is delivered
-back to that chat automatically — just answer normally; do NOT call a tool to
-send your immediate reply (it would post twice).
+This message was relayed from a %s chat. The relay does NOT auto-deliver your
+reply — it only starts this turn. You MUST send your answer back to the user
+yourself by calling the chat-bot app's "notifyLink" workspace tool. Nothing
+you write in this turn reaches the user unless you call notifyLink.
 
-If you start work that finishes AFTER this turn ends (a deployment, an
-autopilot run, any long-running task), send progress or result updates to
-this same chat later with the chat-bot app's "notifyLink" workspace tool:
+To reply to this chat (and to send any later progress for long-running work
+such as a deployment or an autopilot run), call notifyLink:
   - chat link id: %s
-  - arguments: {"id": "%s", "text": "<your update>"}
+  - arguments: {"id": "%s", "text": "<your message>"}
+
+Always end this turn with at least one notifyLink call carrying your answer.
 
 User's message:
 %s`, capitalize(msg.Provider), link.ID, link.ID, msg.Text)
 }
 
-// dispatchToMM resolves the per-chat conversation, relays the user's message
-// to Moses Manager via the synchronous chat call, and sends MM's reply back.
+// dispatchToMM resolves the per-chat conversation and fires a streaming
+// Moses Manager turn. It does NOT harvest the reply: StreamChatMessage is a
+// fire-and-forget POST that the platform acknowledges immediately, then runs
+// the turn in a server-side background goroutine independent of this HTTP
+// connection. MM delivers its answer back to the chat by calling the
+// `notifyLink` workspace tool (see buildRelayPrompt) — that inbound path is
+// Push.handleNotifyLink → Sender.SendToLink → the provider adapter.
+//
+// The streaming path is mandatory: it routes every AI-provider type, whereas
+// the synchronous /api/v1/ai/chat path 500s for Anthropic OAuth subscriptions
+// (CHAT-6j4in), the primary case the relay must serve.
 func (i *Inbound) dispatchToMM(
 	ctx context.Context,
 	link *db.ChatRelayLink,
@@ -472,114 +481,16 @@ func (i *Inbound) dispatchToMM(
 	logger = logger.With(slog.String("conversation_id", conversationID.String()))
 
 	// What MM receives: the user's text wrapped with relay context (chat link
-	// id + how to push async follow-ups).
+	// id + the instruction to deliver its reply via the notifyLink tool).
 	relayPrompt := buildRelayPrompt(link, msg)
 
-	// Deliver via the synchronous chat call. The relay sends ONE final message
-	// per turn, so it only needs MM's complete reply text — streaming buys a
-	// chat provider nothing. The WS-aggregation path (aggregateStream) is kept
-	// in the package but is no longer on the hot path: it depended on a
-	// platform WS `assistant_message_complete` event that did not reliably
-	// arrive, which stranded every turn until the 5-minute StreamTimeout. The
-	// WebSocket delivery model is being re-planned separately.
-	return i.syncFallback(ctx, link, chatClient, conversationID, relayPrompt, "primary", logger)
-}
-
-type streamStatus string
-
-const (
-	streamStatusComplete     streamStatus = "complete"
-	streamStatusTimeout      streamStatus = "timeout"
-	streamStatusDisconnected streamStatus = "disconnected"
-)
-
-// aggregateStream reads from the subscriber's Events() channel, filtering
-// by conversation_id, until it sees assistant_message_complete OR a
-// terminal disconnect signal OR the StreamTimeout fires.
-func (i *Inbound) aggregateStream(
-	ctx context.Context,
-	sub Subscriber,
-	conversationID uuid.UUID,
-	logger *slog.Logger,
-) (string, streamStatus, error) {
-	convStr := conversationID.String()
-	var buf strings.Builder
-	timer := time.NewTimer(i.StreamTimeout)
-	defer timer.Stop()
-
-	events := sub.Events()
-	for {
-		select {
-		case ev, ok := <-events:
-			if !ok {
-				return buf.String(), streamStatusDisconnected, nil
-			}
-			if ev.Type == "error" {
-				// Terminal disconnect emitted by WSSubscriber.run.
-				return buf.String(), streamStatusDisconnected, nil
-			}
-			if ev.ConversationID != "" && ev.ConversationID != convStr {
-				continue
-			}
-			switch ev.Type {
-			case "assistant_message_chunk":
-				// Decode {"content":"..."} or {"text":"..."}.
-				if chunk := extractChunkText(ev.Message); chunk != "" {
-					buf.WriteString(chunk)
-				}
-			case "assistant_message_complete":
-				return buf.String(), streamStatusComplete, nil
-			default:
-				// Subscription ack, domain_event, etc. — ignore.
-			}
-		case <-timer.C:
-			logger.Warn("stream timeout", slog.Duration("after", i.StreamTimeout))
-			return buf.String(), streamStatusTimeout, nil
-		case <-ctx.Done():
-			return buf.String(), streamStatusTimeout, ctx.Err()
-		}
-	}
-}
-
-// extractChunkText pulls the assistant text out of the assistant_message_chunk
-// Message envelope. The platform sometimes uses {"content": "..."} and
-// sometimes {"text": "..."} — accept either.
-func extractChunkText(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var probe map[string]interface{}
-	if err := json.Unmarshal(raw, &probe); err != nil {
-		// Bare string?
-		var s string
-		if json.Unmarshal(raw, &s) == nil {
-			return s
-		}
-		return ""
-	}
-	for _, k := range []string{"content", "text", "chunk", "delta"} {
-		if v, ok := probe[k]; ok {
-			if s, ok := v.(string); ok {
-				return s
-			}
-		}
-	}
-	return ""
-}
-
-// syncFallback calls SendChatMessageSync as a degraded-mode path. The
-// reason string is stamped into outbound message metadata.
-func (i *Inbound) syncFallback(
-	ctx context.Context,
-	link *db.ChatRelayLink,
-	chatClient PerKeyChatClient,
-	conversationID uuid.UUID,
-	prompt string,
-	reason string,
-	logger *slog.Logger,
-) error {
-	resp, err := chatClient.SendChatMessageSync(ctx, mosesclient.ChatSyncOpts{
-		Message:        prompt,
+	// Fire the streaming turn. The platform returns 200 as soon as it has
+	// accepted the turn; the agentic loop then runs in its own background
+	// goroutine. We do not consume any stream — MM pushes its reply via
+	// notifyLink. A failure HERE means the turn never started, so the user
+	// gets nothing unless we tell them.
+	_, err = chatClient.StreamChatMessage(ctx, mosesclient.ChatStreamOpts{
+		Message:        relayPrompt,
 		ConversationID: conversationID.String(),
 	})
 	if err != nil {
@@ -587,19 +498,15 @@ func (i *Inbound) syncFallback(
 			i.handleUnauthorized(ctx, link, logger)
 			return err
 		}
-		logger.Error("sync fallback failed", slog.String("err", err.Error()))
+		logger.Error("start MM turn failed", slog.String("err", err.Error()))
 		_, _ = i.Sender.SendToLink(ctx, link, provider.OutboundMessage{
-			Text: "Moses is temporarily unreachable. Please try again in a moment.",
+			Text: "Couldn't reach Moses just now — your message wasn't delivered. Please try again in a moment.",
 		}, &conversationID)
 		return err
 	}
-	out := provider.OutboundMessage{Text: resp.Message}
-	rowID, sendErr := i.Sender.SendToLink(ctx, link, out, &conversationID)
-	logger.Info("sync fallback delivered",
-		slog.String("reason", reason),
-		slog.String("audit_row", rowID.String()),
-	)
-	return sendErr
+
+	logger.Info("MM turn started; reply will arrive via notifyLink")
+	return nil
 }
 
 // handleUnauthorized marks the link inactive and tells the user to relink.

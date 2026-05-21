@@ -20,7 +20,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"moses-chat-bot/backend/internal/db"
-	"moses-chat-bot/backend/internal/mosesclient"
 	"moses-chat-bot/backend/internal/provider"
 	"moses-chat-bot/backend/internal/provider/providertest"
 	"moses-chat-bot/backend/internal/service/crypto"
@@ -137,17 +136,10 @@ func buildTestInbound(t *testing.T, p *fakeProviderWithSig) *relay.Inbound {
 	env := newWebhookEnvelope(t)
 	link := linker.New(nil, env, nil)
 	sender := relay.NewSender(webhookSenderAdapter{store}, reg, relay.SenderOpts{})
-	pool := relay.NewWSConnPool(relay.WSPoolConfig{
-		BaseWS: "http://moses-backend.test",
-		Dialer: func(_ context.Context, _, _ string, _ mosesclient.WSConfig) (relay.Subscriber, error) {
-			return nil, nil // never called — no-link path
-		},
-	})
 	return relay.NewInbound(
 		store, sender, env, link, reg,
 		func(_ string) relay.PerKeyChatClient { return nil },
-		pool,
-		relay.InboundOpts{StreamTimeout: 100 * time.Millisecond, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
+		relay.InboundOpts{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
 	)
 }
 
