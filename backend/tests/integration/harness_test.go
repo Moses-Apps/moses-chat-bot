@@ -30,6 +30,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -179,8 +180,17 @@ type mockState struct {
 	// Chat / streaming
 	chatStreamStatus int // returned on POST /ai/chat/stream; 0 = 200
 
+	// streamReply, when non-empty, is the assistant turn reply the stub
+	// appends to convMessages when POST /ai/chat/stream fires — simulating
+	// the platform persisting the turn so the relay's poll harvests it.
+	streamReply string
+	// convMessages is the conversation history GET
+	// /chat/conversations/{id}/messages serves (chronological order).
+	convMessages []mosesclient.ChatMessage
+
 	// Conversations
 	createConversationStatus int
+	getMessagesStatus        int // returned on GET .../messages; 0 = 200
 
 	// Autonomous
 	activeSession *mosesclient.AutonomousSession // returned by GET /autonomous/active; nil → 404
@@ -305,6 +315,25 @@ func newMosesBackendStub(t *testing.T) *mosesBackendStub {
 		state.lastStreamConv = body.ConversationID
 		state.lastStreamMsg = body.Message
 		stat := state.chatStreamStatus
+		// Simulate the platform persisting the turn: the user prompt and
+		// (when scripted) the assistant reply land in the conversation so
+		// the relay's subsequent poll harvests them.
+		if stat < 400 {
+			state.convMessages = append(state.convMessages, mosesclient.ChatMessage{
+				ID:        uuid.New(),
+				Role:      "user",
+				Content:   body.Message,
+				CreatedAt: time.Now().Add(time.Duration(len(state.convMessages)+1) * time.Millisecond),
+			})
+			if state.streamReply != "" {
+				state.convMessages = append(state.convMessages, mosesclient.ChatMessage{
+					ID:        uuid.New(),
+					Role:      "assistant",
+					Content:   state.streamReply,
+					CreatedAt: time.Now().Add(time.Duration(len(state.convMessages)+1) * time.Millisecond),
+				})
+			}
+		}
 		state.mu.Unlock()
 		if stat >= 400 {
 			w.WriteHeader(stat)
@@ -316,6 +345,27 @@ func newMosesBackendStub(t *testing.T) *mosesBackendStub {
 			Status:         "processing",
 			ConversationID: body.ConversationID,
 		})
+	})
+
+	// GET /api/v1/chat/conversations/{id}/messages — the relay polls this
+	// after firing a turn to harvest the persisted assistant reply.
+	mux.HandleFunc("GET /api/v1/chat/conversations/{id}/messages", func(w http.ResponseWriter, r *http.Request) {
+		state.mu.Lock()
+		stat := state.getMessagesStatus
+		msgs := append([]mosesclient.ChatMessage(nil), state.convMessages...)
+		state.mu.Unlock()
+		if stat >= 400 {
+			w.WriteHeader(stat)
+			return
+		}
+		if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+			if limit, err := strconv.Atoi(limitStr); err == nil && limit > 0 && len(msgs) > limit {
+				msgs = msgs[len(msgs)-limit:]
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"messages": msgs})
 	})
 
 	// Autonomous endpoints
@@ -461,7 +511,13 @@ func newHarness(t *testing.T) *Harness {
 
 	inbound := relay.NewInbound(
 		store, sender, env, lk, registry, chatFactory,
-		relay.InboundOpts{Logger: logger},
+		relay.InboundOpts{
+			Logger: logger,
+			// Tight cadence so the harvest path resolves fast; the timeout
+			// stays short enough that a no-reply turn cannot stall a test.
+			PollInterval: 10 * time.Millisecond,
+			PollTimeout:  500 * time.Millisecond,
+		},
 	)
 
 	autopilotFactory := func(bearer string) autopilot.MosesClient {

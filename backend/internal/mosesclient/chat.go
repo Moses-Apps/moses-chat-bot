@@ -23,9 +23,10 @@ type ChatStreamOpts struct {
 
 // ChatStreamAck is what the platform returns on the immediate 200
 // from POST /api/v1/ai/chat/stream. The body of the actual assistant
-// turn does NOT flow through this response — it streams via the
-// WebSocket at /api/v1/ai/ws. The caller is expected to have already
-// subscribed to ConversationID before calling this method.
+// turn does NOT flow through this response — the handler runs the
+// agentic loop in a background goroutine and persists the assistant
+// message to the conversation as a side-effect. The relay harvests it
+// by polling GetConversationMessages.
 //
 // See moses-platform-prep/backend/internal/api/ai_chat_handlers.go:367
 // — the handler runs the agentic loop in a background goroutine and
@@ -38,20 +39,21 @@ type ChatStreamAck struct {
 
 // StreamChatMessage triggers a Moses Manager run.
 //
-// This is a fire-and-forget invocation: the method returns as soon as
-// the platform acknowledges the request (HTTP 200, normally within
-// milliseconds — see ChatStreamAck). The platform then runs the agentic
-// loop in a server-side background goroutine on its own context, fully
-// decoupled from this HTTP connection (ai_chat_handlers.go
-// StreamChatMessage → processChatInBackground). The turn therefore runs
-// to completion even though the caller consumes no stream and may
-// disconnect immediately.
+// The method returns as soon as the platform acknowledges the request
+// (HTTP 200, normally within milliseconds — see ChatStreamAck). The
+// platform then runs the agentic loop in a server-side background
+// goroutine on its own context, fully decoupled from this HTTP
+// connection (ai_chat_handlers.go StreamChatMessage →
+// processChatInBackground). The turn therefore runs to completion — and
+// persists the assistant message to the conversation — even though the
+// caller consumes no stream and may disconnect immediately.
 //
 // The chat-bot relay relies on exactly that: it fires this to start a
-// turn and never harvests output — Moses Manager delivers its reply by
-// calling the chat-bot's `notifyLink` workspace tool. The streaming
-// path is also the only path that routes Anthropic OAuth subscriptions;
-// the synchronous /api/v1/ai/chat path 500s for them (CHAT-6j4in).
+// turn, then obtains the reply itself by polling the conversation's
+// persisted messages with GetConversationMessages (see the relay's
+// dispatchToMM). The streaming path is also the only path that routes
+// Anthropic OAuth subscriptions; the synchronous /api/v1/ai/chat path
+// 500s for them (CHAT-6j4in).
 func (c *Client) StreamChatMessage(ctx context.Context, opts ChatStreamOpts) (*ChatStreamAck, error) {
 	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/ai/chat/stream", opts)
 	if err != nil {

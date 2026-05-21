@@ -74,11 +74,16 @@ func TestE2E_NewUserLinks_FirstMessage_RoundTrip(t *testing.T) {
 	_, err = h.Store.GetPendingLinkByCode(h.Ctx, tenantID, codeOut.Code)
 	require.True(t, db.IsNoRows(err), "pending row should be consumed")
 
-	// Step 3: a regular inbound message fires a streaming MM turn.
+	// Step 3: a regular inbound message fires a streaming MM turn and the
+	// relay then HARVESTS the reply itself by polling the conversation
+	// (supersedes the notifyLink-load-bearing model of commit 9f64861).
 	// HandleInbound creates a conversation via the stubbed POST
-	// /chat/conversations, fires StreamChatMessage, and returns — it does
-	// NOT harvest a reply. MM would deliver its answer by calling the
-	// bot's notifyLink workspace tool (covered separately).
+	// /chat/conversations, fires StreamChatMessage, polls
+	// GET .../messages, and delivers the persisted assistant reply.
+	h.Backend.state.mu.Lock()
+	h.Backend.state.streamReply = "Hello from Moses Manager"
+	h.Backend.state.mu.Unlock()
+
 	require.NoError(t, h.Inbound.HandleInbound(context.Background(),
 		inboundMsg(providerUserID, "hello world", "tg-msg-1")))
 
@@ -88,16 +93,21 @@ func TestE2E_NewUserLinks_FirstMessage_RoundTrip(t *testing.T) {
 	require.GreaterOrEqual(t, snap.streamCalls, 1, "stream call did not fire")
 	require.NotEmpty(t, snap.lastStreamConv, "stream call should carry conversationId")
 	assert.Contains(t, snap.lastStreamMsg, "hello world", "the user's text must reach MM")
-	assert.Contains(t, snap.lastStreamMsg, "notifyLink", "MM must be told to deliver via notifyLink")
 
-	// The relay does NOT deliver the turn reply itself — nothing is sent
-	// to the provider and no outbound row is persisted on this path.
-	assert.Empty(t, h.Telegram.Snapshot(), "relay must not send a turn reply itself")
+	// The relay delivered the harvested turn reply itself.
+	sent := h.Telegram.Snapshot()
+	require.Len(t, sent, 1, "relay must deliver exactly one turn reply")
+	assert.Equal(t, "Hello from Moses Manager", sent[0].Msg.Text)
 	msgs, err := h.Store.ListRecentByLink(h.Ctx, link.ID, 10)
 	require.NoError(t, err)
+	outCount := 0
 	for _, m := range msgs {
-		assert.NotEqual(t, "out", m.Direction, "relay must not persist an outbound row for the turn")
+		if m.Direction == "out" {
+			outCount++
+			assert.Equal(t, "Hello from Moses Manager", m.Text)
+		}
 	}
+	assert.Equal(t, 1, outCount, "the delivered reply must be persisted as one outbound row")
 }
 
 // ---------------------------------------------------------------------------
@@ -358,8 +368,14 @@ func TestE2E_ConcurrentInbound_NoDupConversation(t *testing.T) {
 	providerUserID := "tg-concur"
 	link := h.completeLinkE2E(t, tenantID, mosesUserID, providerUserID, "mcp-user-concur")
 
+	// The stub appends an assistant reply on each stream call, so each
+	// turn's poll harvests a reply.
+	h.Backend.state.mu.Lock()
+	h.Backend.state.streamReply = "concurrent reply"
+	h.Backend.state.mu.Unlock()
+
 	// Fire two HandleInbound calls in parallel. Each fires a streaming MM
-	// turn and returns — there is no reply to harvest.
+	// turn, polls the conversation, and delivers the harvested reply.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	for _, mid := range []string{"c-1", "c-2"} {
@@ -375,7 +391,7 @@ func TestE2E_ConcurrentInbound_NoDupConversation(t *testing.T) {
 	go func() { wg.Wait(); close(doneCh) }()
 	select {
 	case <-doneCh:
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("concurrent HandleInbound goroutines did not return")
 	}
 
@@ -393,17 +409,20 @@ func TestE2E_ConcurrentInbound_NoDupConversation(t *testing.T) {
 	assert.GreaterOrEqual(t, snap.streamCalls, 2, "both turns fired a stream call")
 	assert.Equal(t, convStr, snap.lastStreamConv, "stream calls share the chat-state conversation id")
 
-	// Both inbound rows persisted; the relay sent no turn reply itself.
+	// Both inbound rows persisted; both turns delivered a harvested reply.
 	msgs, err := h.Store.ListRecentByLink(h.Ctx, link.ID, 50)
 	require.NoError(t, err)
-	inCount := 0
+	inCount, outCount := 0, 0
 	for _, m := range msgs {
-		if m.Direction == "in" {
+		switch m.Direction {
+		case "in":
 			inCount++
+		case "out":
+			outCount++
 		}
-		assert.NotEqual(t, "out", m.Direction, "relay must not persist an outbound row for the turn")
 	}
 	assert.Equal(t, 2, inCount, "both inbound messages persisted")
+	assert.GreaterOrEqual(t, outCount, 1, "the relay delivered harvested replies")
 }
 
 // ---------------------------------------------------------------------------

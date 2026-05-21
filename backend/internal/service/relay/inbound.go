@@ -3,14 +3,26 @@
 // the egress half; this file owns command dispatch and conversation
 // resolution.
 //
-// Delivery model: the relay fires the streaming chat invocation
-// (StreamChatMessage) to kick off a Moses Manager turn and then returns —
-// it does NOT harvest the reply. The streaming path is what routes every
-// AI-provider type, including Anthropic OAuth subscriptions, which the
-// synchronous /api/v1/ai/chat path structurally cannot serve (CHAT-6j4in).
-// MM delivers its answer back to the chat by calling the `notifyLink`
-// workspace tool (POST /api/v1/workspace/links/{id}/notify → Push →
-// Sender.SendToLink → Telegram); buildRelayPrompt instructs it to do so.
+// Delivery model (supersedes the notifyLink-load-bearing model of commit
+// 9f64861): the relay fires the streaming chat invocation
+// (StreamChatMessage) to kick off a Moses Manager turn, then OBTAINS THE
+// TURN REPLY ITSELF by polling the conversation's persisted messages for
+// the assistant answer and delivering it via Sender.SendToLink. The
+// streaming path is kept because it is what routes every AI-provider
+// type, including Anthropic OAuth subscriptions, which the synchronous
+// /api/v1/ai/chat path structurally cannot serve (CHAT-6j4in).
+//
+// Why polling works: StreamChatMessage hits /api/v1/ai/chat/stream, which
+// returns immediately and runs the turn in processChatInBackground on a
+// server-side background context — the turn completes regardless of the
+// HTTP connection and PERSISTS the assistant message to the conversation.
+// So after firing the turn the relay can poll the conversation messages
+// until the new assistant reply appears.
+//
+// notifyLink reverts to async follow-ups ONLY (work that finishes after
+// the turn ends — a deployment, an autopilot run). It is no longer in the
+// critical path of the basic turn reply, so a missed notifyLink call can
+// no longer leave the user silent.
 //
 // Concurrency model: HandleInbound is safe to invoke from many goroutines
 // at once. Telegram serialises a 1:1 chat by design, so concurrent turns
@@ -76,15 +88,17 @@ var _ InboundStore = (*db.Store)(nil)
 // user's bearer key. Different links carry different keys, so we cannot
 // reuse one client across users — but we DO reuse the underlying *http.Client.
 //
-// The relay invokes MM via StreamChatMessage only: that fire-and-forget
-// POST returns once the platform has accepted the turn (the turn then runs
-// in a server-side background goroutine on context.Background, decoupled
-// from the HTTP connection — see ai_chat_handlers.go StreamChatMessage).
-// The streaming path routes every provider type including OAuth
-// subscriptions; the synchronous path cannot (CHAT-6j4in).
+// The relay invokes MM via StreamChatMessage: that POST returns once the
+// platform has accepted the turn (the turn then runs in a server-side
+// background goroutine, decoupled from the HTTP connection — see
+// ai_chat_handlers.go StreamChatMessage). The streaming path routes every
+// provider type including OAuth subscriptions; the synchronous path
+// cannot (CHAT-6j4in). The relay then obtains the turn reply itself via
+// GetConversationMessages — see dispatchToMM.
 type PerKeyChatClient interface {
 	CreateConversation(ctx context.Context, opts mosesclient.CreateConversationOpts) (*mosesclient.Conversation, error)
 	StreamChatMessage(ctx context.Context, opts mosesclient.ChatStreamOpts) (*mosesclient.ChatStreamAck, error)
+	GetConversationMessages(ctx context.Context, conversationID uuid.UUID, limit int) ([]mosesclient.ChatMessage, error)
 }
 
 // ChatClientFactory returns a PerKeyChatClient configured to authenticate
@@ -92,12 +106,37 @@ type PerKeyChatClient interface {
 // to a closure around *mosesclient.Client.NewClient + BearerAuth.
 type ChatClientFactory func(bearer string) PerKeyChatClient
 
+// Polling defaults for harvesting the Moses Manager turn reply. The relay
+// fires StreamChatMessage and then polls the conversation's persisted
+// messages until the assistant answer for this turn appears.
+const (
+	// defaultPollInterval is the gap between conversation polls. A few
+	// seconds keeps backend load low (one cheap GET per interval per
+	// in-flight turn) while still feeling responsive on a chat UI.
+	defaultPollInterval = 3 * time.Second
+
+	// defaultPollTimeout caps how long the relay waits for the assistant
+	// reply before giving the user a "still working" message. Moses
+	// Manager turns are usually well under a minute; multi-tool agentic
+	// loops can run longer, so we allow a few minutes. The turn keeps
+	// running server-side past this — only the relay's wait ends.
+	defaultPollTimeout = 4 * time.Minute
+)
+
 // InboundOpts configures the Inbound service.
 type InboundOpts struct {
 	// MaxConcurrent caps in-flight HandleInbound goroutines. The webhook
 	// handler enforces the semaphore upstream; setting it here is
 	// informational. Default 32.
 	MaxConcurrent int
+
+	// PollInterval is the gap between conversation polls while waiting
+	// for the Moses Manager turn reply. Default defaultPollInterval.
+	PollInterval time.Duration
+
+	// PollTimeout caps the wait for the turn reply. On timeout the user
+	// gets a brief "still working" message. Default defaultPollTimeout.
+	PollTimeout time.Duration
 
 	// Logger is required for diagnostics. main passes a configured
 	// slog.Logger; tests may pass slog.New(slog.NewTextHandler(io.Discard, nil)).
@@ -113,6 +152,11 @@ type Inbound struct {
 	Registry    *provider.Registry
 	ChatFactory ChatClientFactory
 	Logger      *slog.Logger
+
+	// PollInterval / PollTimeout govern how the relay harvests the Moses
+	// Manager turn reply from the conversation. Defaulted in NewInbound.
+	PollInterval time.Duration
+	PollTimeout  time.Duration
 
 	// Autopilot is optional — when nil the /autopilot command surface
 	// degrades to a "not configured" reply. main.go wires this; tests
@@ -135,14 +179,24 @@ func NewInbound(
 	if logger == nil {
 		logger = slog.Default()
 	}
+	pollInterval := opts.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = defaultPollInterval
+	}
+	pollTimeout := opts.PollTimeout
+	if pollTimeout <= 0 {
+		pollTimeout = defaultPollTimeout
+	}
 	return &Inbound{
-		Store:       store,
-		Sender:      sender,
-		Envelope:    env,
-		Linker:      link,
-		Registry:    registry,
-		ChatFactory: chatFactory,
-		Logger:      logger,
+		Store:        store,
+		Sender:       sender,
+		Envelope:     env,
+		Linker:       link,
+		Registry:     registry,
+		ChatFactory:  chatFactory,
+		Logger:       logger,
+		PollInterval: pollInterval,
+		PollTimeout:  pollTimeout,
 	}
 }
 
@@ -397,41 +451,45 @@ func (i *Inbound) replyText(ctx context.Context, link *db.ChatRelayLink, text st
 }
 
 // buildRelayPrompt wraps the user's provider-chat message with relay context
-// for Moses Manager. The relay does NOT auto-deliver this turn's reply — it
-// only invokes MM and returns. MM is therefore instructed to send its answer
-// (and any later progress) back to this chat itself by calling the chat-bot
-// app's `notifyLink` workspace tool, keyed by this link's ID. Without the
-// link ID, MM has no way to address the chat; without the instruction, it
-// does not know the surface exists or that it must use it.
+// for Moses Manager. The relay obtains this turn's reply ITSELF — it polls
+// the conversation for the persisted assistant message and delivers it — so
+// MM should just answer normally. MM is told to use the chat-bot app's
+// `notifyLink` workspace tool ONLY for async follow-ups: progress or results
+// for work that finishes AFTER this turn ends (a deployment, an autopilot
+// run). Without the link ID, MM has no way to address the chat for those
+// later updates; without the instruction, it does not know the surface
+// exists. Using notifyLink for the immediate turn reply would post twice.
 func buildRelayPrompt(link *db.ChatRelayLink, msg provider.InboundMessage) string {
 	return fmt.Sprintf(`[moses-chat-bot relay context]
-This message was relayed from a %s chat. The relay does NOT auto-deliver your
-reply — it only starts this turn. You MUST send your answer back to the user
-yourself by calling the chat-bot app's "notifyLink" workspace tool. Nothing
-you write in this turn reaches the user unless you call notifyLink.
+This message was relayed from a %s chat. Your reply to this turn is delivered
+back to that chat automatically — just answer normally; do NOT call a tool to
+send your immediate reply (it would post twice).
 
-To reply to this chat (and to send any later progress for long-running work
-such as a deployment or an autopilot run), call notifyLink:
+If you start work that finishes AFTER this turn ends (a deployment, an
+autopilot run, any long-running task), send progress or result updates to
+this same chat later with the chat-bot app's "notifyLink" workspace tool:
   - chat link id: %s
-  - arguments: {"id": "%s", "text": "<your message>"}
-
-Always end this turn with at least one notifyLink call carrying your answer.
+  - arguments: {"id": "%s", "text": "<your update>"}
 
 User's message:
 %s`, capitalize(msg.Provider), link.ID, link.ID, msg.Text)
 }
 
-// dispatchToMM resolves the per-chat conversation and fires a streaming
-// Moses Manager turn. It does NOT harvest the reply: StreamChatMessage is a
-// fire-and-forget POST that the platform acknowledges immediately, then runs
-// the turn in a server-side background goroutine independent of this HTTP
-// connection. MM delivers its answer back to the chat by calling the
-// `notifyLink` workspace tool (see buildRelayPrompt) — that inbound path is
-// Push.handleNotifyLink → Sender.SendToLink → the provider adapter.
+// dispatchToMM resolves the per-chat conversation, fires a streaming Moses
+// Manager turn, then OBTAINS THE TURN REPLY ITSELF by polling the
+// conversation's persisted messages and delivers it via Sender.SendToLink.
 //
-// The streaming path is mandatory: it routes every AI-provider type, whereas
-// the synchronous /api/v1/ai/chat path 500s for Anthropic OAuth subscriptions
-// (CHAT-6j4in), the primary case the relay must serve.
+// The streaming invocation (StreamChatMessage) is mandatory: it routes
+// every AI-provider type, whereas the synchronous /api/v1/ai/chat path
+// 500s for Anthropic OAuth subscriptions (CHAT-6j4in), the primary case
+// the relay must serve. The platform acknowledges the POST immediately
+// and runs the agentic loop in a server-side background goroutine,
+// persisting the assistant turn to the conversation when it completes.
+//
+// The relay no longer depends on MM calling the notifyLink workspace tool
+// for the basic reply (that was the model in commit 9f64861, which put a
+// human grant-approval step in the critical path of every reply and risked
+// total silence). notifyLink is now for async follow-ups only.
 func (i *Inbound) dispatchToMM(
 	ctx context.Context,
 	link *db.ChatRelayLink,
@@ -480,15 +538,31 @@ func (i *Inbound) dispatchToMM(
 	}
 	logger = logger.With(slog.String("conversation_id", conversationID.String()))
 
-	// What MM receives: the user's text wrapped with relay context (chat link
-	// id + the instruction to deliver its reply via the notifyLink tool).
+	// Record a baseline BEFORE firing the turn: the newest message already
+	// in the conversation. The turn reply is the first assistant message
+	// that appears after this baseline. For a fresh conversation the
+	// baseline is the zero time, so any assistant message qualifies.
+	baseline, err := i.latestMessageTime(ctx, chatClient, conversationID)
+	if err != nil {
+		if errors.Is(err, mosesclient.ErrUnauthorized) {
+			i.handleUnauthorized(ctx, link, logger)
+			return err
+		}
+		// A non-fatal baseline read failure (transient 5xx, fresh
+		// conversation 404) must not block the turn — fall back to the
+		// zero time and let the poller pick the first assistant message.
+		logger.Warn("baseline read failed; using zero baseline", slog.String("err", err.Error()))
+		baseline = time.Time{}
+	}
+
+	// What MM receives: the user's text wrapped with relay context.
 	relayPrompt := buildRelayPrompt(link, msg)
 
 	// Fire the streaming turn. The platform returns 200 as soon as it has
 	// accepted the turn; the agentic loop then runs in its own background
-	// goroutine. We do not consume any stream — MM pushes its reply via
-	// notifyLink. A failure HERE means the turn never started, so the user
-	// gets nothing unless we tell them.
+	// goroutine and persists the assistant message on completion. A failure
+	// HERE means the turn never started, so the user gets nothing unless we
+	// tell them.
 	_, err = chatClient.StreamChatMessage(ctx, mosesclient.ChatStreamOpts{
 		Message:        relayPrompt,
 		ConversationID: conversationID.String(),
@@ -504,9 +578,136 @@ func (i *Inbound) dispatchToMM(
 		}, &conversationID)
 		return err
 	}
+	logger.Info("MM turn started; polling conversation for reply")
 
-	logger.Info("MM turn started; reply will arrive via notifyLink")
+	// Poll the conversation until the assistant reply lands or the timeout
+	// fires. The turn keeps running server-side past the timeout — only the
+	// relay's wait ends.
+	reply, err := i.pollForReply(ctx, chatClient, link, conversationID, baseline, logger)
+	if err != nil {
+		if errors.Is(err, mosesclient.ErrUnauthorized) {
+			i.handleUnauthorized(ctx, link, logger)
+			return err
+		}
+		if errors.Is(err, errPollTimeout) {
+			logger.Warn("MM reply poll timed out")
+			_, _ = i.Sender.SendToLink(ctx, link, provider.OutboundMessage{
+				Text: "Moses is still working on this — I'll send the answer here as soon as it's ready.",
+			}, &conversationID)
+			return nil
+		}
+		// Context cancellation or a persistent poll error.
+		logger.Error("poll for MM reply failed", slog.String("err", err.Error()))
+		return err
+	}
+
+	if _, err := i.Sender.SendToLink(ctx, link, provider.OutboundMessage{Text: reply}, &conversationID); err != nil {
+		logger.Error("deliver MM reply failed", slog.String("err", err.Error()))
+		return err
+	}
+	logger.Info("MM reply delivered")
 	return nil
+}
+
+// errPollTimeout is the sentinel pollForReply returns when the assistant
+// reply does not appear before PollTimeout. dispatchToMM maps it to a
+// brief "still working" message rather than treating it as an error.
+var errPollTimeout = errors.New("relay: timed out waiting for MM reply")
+
+// latestMessageTime returns the CreatedAt of the newest message currently
+// in the conversation, or the zero time when the conversation is empty or
+// does not exist yet (404). It is the pre-turn baseline: the assistant
+// reply is the first message newer than this.
+func (i *Inbound) latestMessageTime(
+	ctx context.Context,
+	chatClient PerKeyChatClient,
+	conversationID uuid.UUID,
+) (time.Time, error) {
+	// limit=1 is enough — messages come back chronologically, so a 1-row
+	// page is the single newest message.
+	msgs, err := chatClient.GetConversationMessages(ctx, conversationID, 1)
+	if err != nil {
+		if errors.Is(err, mosesclient.ErrNotFound) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	if len(msgs) == 0 {
+		return time.Time{}, nil
+	}
+	return msgs[len(msgs)-1].CreatedAt, nil
+}
+
+// pollForReply polls the conversation on PollInterval until an assistant
+// message strictly newer than baseline appears, then returns its text. It
+// returns errPollTimeout when PollTimeout elapses first, ErrUnauthorized
+// when the key is revoked mid-poll, or a context error on cancellation.
+//
+// Transient poll errors (5xx, network blips) are logged and retried — a
+// single bad GET must not abandon a turn whose reply may already be on the
+// way. Only a revoked key or context cancellation stops the loop early.
+func (i *Inbound) pollForReply(
+	ctx context.Context,
+	chatClient PerKeyChatClient,
+	link *db.ChatRelayLink,
+	conversationID uuid.UUID,
+	baseline time.Time,
+	logger *slog.Logger,
+) (string, error) {
+	pollCtx, cancel := context.WithTimeout(ctx, i.PollTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(i.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		// Check immediately on entry and then once per tick — the turn is
+		// already running, and a fast reply should not wait a full interval.
+		msgs, err := chatClient.GetConversationMessages(pollCtx, conversationID, 50)
+		if err != nil {
+			if errors.Is(err, mosesclient.ErrUnauthorized) {
+				return "", err
+			}
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				// Distinguish "our poll timeout" from the parent context.
+				if ctx.Err() == nil {
+					return "", errPollTimeout
+				}
+				return "", ctx.Err()
+			}
+			logger.Warn("conversation poll error; retrying", slog.String("err", err.Error()))
+		} else if reply, ok := newestAssistantAfter(msgs, baseline); ok {
+			return reply, nil
+		}
+
+		select {
+		case <-pollCtx.Done():
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			return "", errPollTimeout
+		case <-ticker.C:
+		}
+	}
+}
+
+// newestAssistantAfter scans a chronologically-ordered message slice and
+// returns the text of the newest assistant message strictly newer than
+// baseline. ok is false when no such message exists.
+func newestAssistantAfter(msgs []mosesclient.ChatMessage, baseline time.Time) (string, bool) {
+	for idx := len(msgs) - 1; idx >= 0; idx-- {
+		m := msgs[idx]
+		if m.Role != "assistant" {
+			continue
+		}
+		if m.CreatedAt.After(baseline) {
+			return m.Content, true
+		}
+		// Older than the baseline — and everything before it is older
+		// still, so no qualifying assistant message exists.
+		return "", false
+	}
+	return "", false
 }
 
 // handleUnauthorized marks the link inactive and tells the user to relink.
