@@ -18,10 +18,19 @@ import (
 // APIClient.baseURL so a httptest.Server can stand in for the real API.
 const defaultBaseURL = "https://api.telegram.org"
 
-// defaultTimeout is applied to the bundled http.Client when the caller does
-// not supply one. The Telegram API is generally fast; 10s is generous enough
-// for setWebhook calls but short enough to surface dead networks promptly.
-const defaultTimeout = 10 * time.Second
+// defaultTimeout is the http.Client.Timeout for the bundled client when the
+// caller supplies none. It is a BACKSTOP, not the primary bound: every call
+// passes a context whose deadline does the real governing — a quick
+// setWebhook/sendMessage, or the getUpdates long-poll whose context is
+// longPollTimeout + pollHTTPSlack (~45s, see adapter.go).
+//
+// It MUST comfortably exceed that long-poll budget. http.Client.Timeout is a
+// hard wall on the WHOLE request regardless of the context, so a value shorter
+// than the long-poll aborts every empty getUpdates client-side with
+// "Client.Timeout exceeded while awaiting headers" — silently breaking ALL
+// inbound Telegram traffic. (It was 10s, shorter than the 30s long-poll; the
+// regression guard TestDefaultTimeoutExceedsLongPoll keeps this honest.)
+const defaultTimeout = 60 * time.Second
 
 // APIClient is the typed, minimal wrapper around the Telegram Bot API.
 // It is intentionally NOT a generic SDK — only the four methods the relay

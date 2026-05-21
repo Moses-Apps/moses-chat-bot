@@ -235,3 +235,18 @@ func TestAPI_SetMyCommands_RequestShape(t *testing.T) {
 		t.Fatalf("unexpected commands payload: %v", gotBody["commands"])
 	}
 }
+
+// TestDefaultTimeoutExceedsLongPoll is the regression guard for the inbound
+// outage: the shared http.Client.Timeout is a hard wall on the whole request,
+// so it must comfortably exceed the getUpdates long-poll budget
+// (longPollTimeout + pollHTTPSlack). A shorter value aborts every empty
+// getUpdates client-side and silently breaks ALL inbound Telegram traffic.
+func TestDefaultTimeoutExceedsLongPoll(t *testing.T) {
+	longPollBudget := longPollTimeout + pollHTTPSlack
+	if defaultTimeout <= longPollBudget {
+		t.Fatalf("defaultTimeout (%s) must exceed the long-poll budget "+
+			"longPollTimeout+pollHTTPSlack (%s) — a shorter http.Client.Timeout "+
+			"aborts every empty getUpdates and breaks all inbound traffic",
+			defaultTimeout, longPollBudget)
+	}
+}
