@@ -33,15 +33,15 @@ helm.sh/chart: {{ include "moses-chat-bot.chart" . }}
 {{ include "moses-chat-bot.selectorLabels" . }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-moses.ai/tenant-id: {{ .Values.moses.tenantId | quote }}
-moses.ai/execution-id: {{ .Values.moses.executionId | quote }}
+moses-manager.eu/tenant-id: {{ .Values.moses.tenantId | quote }}
+moses-manager.eu/execution-id: {{ .Values.moses.executionId | quote }}
 {{- if .Values.moses.chartId }}
-moses.ai/chart-id: {{ .Values.moses.chartId | quote }}
+moses-manager.eu/chart-id: {{ .Values.moses.chartId | quote }}
 {{- end }}
 {{- if .Values.moses.appSlug }}
-moses.ai/app-slug: {{ .Values.moses.appSlug | quote }}
+moses-manager.eu/app-slug: {{ .Values.moses.appSlug | quote }}
 {{- end }}
-moses.ai/managed-by: moses
+moses-manager.eu/managed-by: moses
 {{- end }}
 
 {{/*

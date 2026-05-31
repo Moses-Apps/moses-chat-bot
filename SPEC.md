@@ -338,7 +338,7 @@ Non-command messages → forwarded as regular chat to MM.
   "description": "Bridge Moses Manager to mobile chat (Telegram, Discord, Slack)...",
   "appType": "hybrid",
   "entrypoint": "index.html",
-  "templateApiVersion": "moses.ai/v1",
+  "templateApiVersion": "moses-manager.eu/v1",
   "embedding": { "framing": "moses-only" },
   "displayLocations": ["apps"],
   "permissions": [],

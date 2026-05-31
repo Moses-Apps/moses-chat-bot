@@ -16,14 +16,14 @@ spec:
       labels:
         {{- include "moses-chat-bot.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: frontend
-        moses.ai/tenant-id: {{ .Values.moses.tenantId | quote }}
+        moses-manager.eu/tenant-id: {{ .Values.moses.tenantId | quote }}
         {{- if .Values.moses.chartId }}
-        moses.ai/chart-id: {{ .Values.moses.chartId | quote }}
+        moses-manager.eu/chart-id: {{ .Values.moses.chartId | quote }}
         {{- end }}
         {{- if .Values.moses.appSlug }}
-        moses.ai/app-slug: {{ .Values.moses.appSlug | quote }}
+        moses-manager.eu/app-slug: {{ .Values.moses.appSlug | quote }}
         {{- end }}
-        moses.ai/managed-by: moses
+        moses-manager.eu/managed-by: moses
     spec:
       {{- with .Values.podSecurityContext }}
       securityContext:
