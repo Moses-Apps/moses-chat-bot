@@ -2,24 +2,32 @@
 //
 // Layered architecture:
 //   - `MessageFilters` owns the controlled inputs (text / chips / direction /
-//     date), debouncing the text input itself.
-//   - `useMessagesStore` owns the search state and the API-fetched + client-
-//     filtered buffer. Each filter change triggers `searchAll()` to reset the
-//     cursor and refetch.
+//     date), debouncing the text input itself. The filter object is *client/UI
+//     state* (component useState).
+//   - `useSearchMessages` (TanStack useInfiniteQuery) owns the *server state*:
+//     the cursor-paginated message buffer. Changing a filter changes the query
+//     key → fresh first page; `fetchNextPage` advances pages within a key.
+//   - `applyClientFilters` narrows the flattened pages by direction/text/date
+//     (filters the backend doesn't accept yet).
 //   - `MessageList` renders the buffer + an IntersectionObserver sentinel that
-//     calls `loadMore()`.
+//     calls `fetchNextPage`.
 //
 // TODO(server-side filters): direction, full-text, and date range are still
 // applied client-side after fetch (see bot-api.ts `searchMessages`). When the
-// backend grows server-side support, swap the `toApiParams` helper in
-// messagesStore.ts to forward the filters directly. Tracked in beads.
+// backend grows server-side support, forward them in `toApiParams`
+// (api/messageFilters.ts) directly. Tracked in beads.
 
-import { useEffect, type ReactElement } from 'react';
+import { useMemo, useState, type ReactElement } from 'react';
 import BentoCard from '@/components/layout/BentoCard';
 import MessageFilters from '@/components/messages/MessageFilters';
 import MessageList from '@/components/messages/MessageList';
-import { useLinksStore } from '@/stores/linksStore';
-import { useMessagesStore } from '@/stores/messagesStore';
+import { useLinks, useSearchMessages } from '@/api/hooks';
+import {
+  EMPTY_FILTERS,
+  applyClientFilters,
+  type MessagesFilters,
+} from '@/api/messageFilters';
+import { getErrorMessage } from '@/lib/errors';
 
 function SkeletonRow(): ReactElement {
   return (
@@ -55,52 +63,46 @@ function EmptyState(): ReactElement {
 }
 
 export default function Messages(): ReactElement {
-  const links = useLinksStore((s) => s.links);
-  const fetchLinks = useLinksStore((s) => s.fetchLinks);
+  // Links populate the chip filter and per-row label resolution (provider icon
+  // + display name). Server state via TanStack Query.
+  const { data: links = [] } = useLinks();
 
-  const filters = useMessagesStore((s) => s.filters);
-  const pageMessages = useMessagesStore((s) => s.pageMessages);
-  const hasMore = useMessagesStore((s) => s.hasMore);
-  const searching = useMessagesStore((s) => s.searching);
-  const searchError = useMessagesStore((s) => s.searchError);
-  const setFilters = useMessagesStore((s) => s.setFilters);
-  const searchAll = useMessagesStore((s) => s.searchAll);
-  const loadMore = useMessagesStore((s) => s.loadMore);
+  // Filters are client/UI state.
+  const [filters, setFilters] = useState<MessagesFilters>({ ...EMPTY_FILTERS });
+  const patchFilters = (patch: Partial<MessagesFilters>) =>
+    setFilters((prev) => ({ ...prev, ...patch }));
 
-  // Ensure we have links to populate the chip filter and the per-row label
-  // resolution (provider icon + display name).
-  useEffect(() => {
-    if (links.length === 0) void fetchLinks();
-  }, [links.length, fetchLinks]);
+  // Server state: cursor-paginated buffer. The filter object is part of the
+  // query key inside the hook, so changing a filter refetches the first page.
+  const search = useSearchMessages(filters);
 
-  // Re-run search whenever the filter shape changes. The store handles
-  // resetting the cursor + buffer. Stringify the linkIds array first so the
-  // dependency array stays statically checkable.
-  const linkIdsKey = filters.linkIds.join(',');
-  useEffect(() => {
-    void searchAll();
-    // searchAll is a stable store action; safe to omit per Zustand conventions.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters.q, filters.direction, filters.dateFrom, filters.dateTo, linkIdsKey]);
+  // Flatten pages, then apply the client-side filters the backend can't.
+  const pageMessages = useMemo(() => {
+    const rows = search.data?.pages.flatMap((p) => p.messages) ?? [];
+    return applyClientFilters(rows, filters);
+  }, [search.data, filters]);
 
-  const initialLoading = searching && pageMessages.length === 0;
+  const hasMore = Boolean(search.hasNextPage);
+  // Any fetch (first page or next page) counts as "searching" for the spinner.
+  const searching = search.isPending || search.isFetchingNextPage;
+  const initialLoading = search.isPending;
 
   return (
     <div className="space-y-4">
-      <MessageFilters links={links} filters={filters} onChange={setFilters} />
+      <MessageFilters links={links} filters={filters} onChange={patchFilters} />
 
       <BentoCard title="Messages" subtitle="Relay history across every linked chat">
-        {searchError ? (
+        {search.isError ? (
           <div
             role="alert"
             className="flex flex-col gap-3 rounded-bento border border-moses-status-error/40 bg-moses-status-error/10 p-4 sm:flex-row sm:items-center sm:justify-between"
           >
             <p className="text-sm text-moses-status-error">
-              Could not load messages: {searchError.message}
+              Could not load messages: {getErrorMessage(search.error)}
             </p>
             <button
               type="button"
-              onClick={() => void searchAll()}
+              onClick={() => void search.refetch()}
               className="min-h-[44px] rounded-bento border border-moses-status-error/50 bg-moses-surface-raised px-4 text-sm font-medium text-moses-status-error hover:bg-moses-status-error/10 focus:outline-none focus:ring-2 focus:ring-moses-status-error/40 dark:bg-moses-surface-dark-raised"
             >
               Retry
@@ -121,7 +123,7 @@ export default function Messages(): ReactElement {
             links={links}
             hasMore={hasMore}
             loading={searching}
-            onLoadMore={() => void loadMore()}
+            onLoadMore={() => void search.fetchNextPage()}
           />
         )}
       </BentoCard>

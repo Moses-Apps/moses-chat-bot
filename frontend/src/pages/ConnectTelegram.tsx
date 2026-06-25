@@ -15,18 +15,17 @@
 // The route is admin-gated: a non-admin viewer sees a "permission required"
 // card instead of the wizard.
 
-import { useCallback, useEffect, useState, type ReactElement } from 'react';
+import { useCallback, useState, type ReactElement } from 'react';
 import { Link as RouterLink } from 'react-router-dom';
 
 import BentoCard from '@/components/layout/BentoCard';
-import { getViewer } from '@/lib/platform';
 import {
-  getTelegramInfo,
-  connectTelegram,
-  disconnectTelegram,
-  type TelegramBotInfo,
-} from '@/lib/bot-api';
-import type { ApiError } from '@/lib/api';
+  useViewer,
+  useTelegramInfo,
+  useConnectTelegram,
+  useDisconnectTelegram,
+} from '@/api/hooks';
+import { getErrorMessage } from '@/lib/errors';
 
 const BOTFATHER_URL = 'https://t.me/botfather';
 
@@ -46,17 +45,6 @@ const BOTFATHER_STEPS = [
 ];
 
 type Gate = 'checking' | 'allowed' | 'forbidden';
-
-function toApiError(err: unknown): ApiError {
-  if (err && typeof err === 'object' && 'status' in err && 'message' in err) {
-    return err as ApiError;
-  }
-  return {
-    status: 0,
-    code: 'unknown',
-    message: err instanceof Error ? err.message : 'Unknown error',
-  };
-}
 
 /** Small copy-to-clipboard button reused for each BotFather command. */
 function CopyField({ value, label }: { value: string; label: string }): ReactElement {
@@ -94,70 +82,54 @@ function CopyField({ value, label }: { value: string; label: string }): ReactEle
 }
 
 export default function ConnectTelegram(): ReactElement {
-  const [gate, setGate] = useState<Gate>('checking');
-  const [info, setInfo] = useState<TelegramBotInfo | null>(null);
   const [token, setToken] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [disconnecting, setDisconnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // On mount: gate on admin status, then load the current connection state.
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const viewer = await getViewer();
-        if (cancelled) return;
-        if (!viewer.isTenantAdmin) {
-          setGate('forbidden');
-          return;
-        }
-        setGate('allowed');
-        const current = await getTelegramInfo();
-        if (!cancelled) setInfo(current);
-      } catch (err) {
-        if (cancelled) return;
-        // If we can't confirm admin status, fail closed.
-        setGate('forbidden');
-        setError(toApiError(err).message);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // Admin gate (server state). Fail closed: a viewer error → forbidden.
+  const viewer = useViewer();
+  const isAdmin = viewer.data?.isTenantAdmin ?? false;
 
-  const onConnect = useCallback(async () => {
+  // Only an admin loads the connection state — mirrors the original flow where
+  // getTelegramInfo is never called for a non-admin viewer.
+  const telegram = useTelegramInfo(isAdmin);
+  const info = telegram.data ?? null;
+
+  const connect = useConnectTelegram();
+  const disconnect = useDisconnectTelegram();
+  const submitting = connect.isPending;
+  const disconnecting = disconnect.isPending;
+
+  const gate: Gate = viewer.isPending
+    ? 'checking'
+    : isAdmin
+      ? 'allowed'
+      : 'forbidden';
+
+  // Surface a viewer-resolution failure on the forbidden card.
+  const viewerError = viewer.isError ? getErrorMessage(viewer.error) : null;
+  const displayError = error ?? viewerError;
+
+  const onConnect = useCallback(() => {
     const trimmed = token.trim();
     if (!trimmed) {
       setError('Paste the token BotFather gave you.');
       return;
     }
-    setSubmitting(true);
     setError(null);
-    try {
-      const result = await connectTelegram(trimmed);
-      setInfo(result);
-      setToken('');
-    } catch (err) {
-      setError(toApiError(err).message || 'Could not connect the bot.');
-    } finally {
-      setSubmitting(false);
-    }
-  }, [token]);
+    connect.mutate(trimmed, {
+      onSuccess: () => setToken(''),
+      onError: (err) =>
+        setError(getErrorMessage(err) || 'Could not connect the bot.'),
+    });
+  }, [token, connect]);
 
-  const onDisconnect = useCallback(async () => {
-    setDisconnecting(true);
+  const onDisconnect = useCallback(() => {
     setError(null);
-    try {
-      await disconnectTelegram();
-      setInfo({ configured: false });
-    } catch (err) {
-      setError(toApiError(err).message || 'Could not disconnect the bot.');
-    } finally {
-      setDisconnecting(false);
-    }
-  }, []);
+    disconnect.mutate(undefined, {
+      onError: (err) =>
+        setError(getErrorMessage(err) || 'Could not disconnect the bot.'),
+    });
+  }, [disconnect]);
 
   if (gate === 'checking') {
     return (
@@ -182,9 +154,9 @@ export default function ConnectTelegram(): ReactElement {
             Connecting a Telegram bot for the whole workspace is an
             administrator action. Ask a tenant admin to set this up.
           </p>
-          {error && (
+          {displayError && (
             <p role="alert" className="mt-3 text-sm text-moses-status-error">
-              {error}
+              {displayError}
             </p>
           )}
           <RouterLink

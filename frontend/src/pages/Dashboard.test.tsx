@@ -16,7 +16,7 @@ vi.mock('@/lib/bot-api', async () => {
 });
 
 import { listLinks } from '@/lib/bot-api';
-import { useLinksStore } from '@/stores/linksStore';
+import { withQueryClient } from '@/test/queryWrapper';
 import Dashboard from './Dashboard';
 
 const sampleLinks: Link[] = [
@@ -30,26 +30,18 @@ const sampleLinks: Link[] = [
   },
 ];
 
-function reset(): void {
-  useLinksStore.setState({
-    links: [],
-    currentLink: null,
-    loading: false,
-    error: null,
-  });
-}
-
 function renderDashboard() {
   return render(
-    <MemoryRouter>
-      <Dashboard />
-    </MemoryRouter>,
+    withQueryClient(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    ),
   );
 }
 
 describe('<Dashboard />', () => {
   beforeEach(() => {
-    reset();
     vi.mocked(listLinks).mockReset();
   });
 
@@ -57,7 +49,9 @@ describe('<Dashboard />', () => {
     vi.mocked(listLinks).mockResolvedValueOnce([]);
     const { container } = renderDashboard();
     await waitFor(() => expect(listLinks).toHaveBeenCalledTimes(1));
-    expect(screen.getByText(/connect your first chat/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByText(/connect your first chat/i)).toBeInTheDocument(),
+    );
     // There are two CTAs — one in the empty card, one in the "Link a new chat" card.
     const ctas = screen.getAllByRole('link', { name: /link/i }).filter(
       (el) => el.getAttribute('href') === '/link/new',

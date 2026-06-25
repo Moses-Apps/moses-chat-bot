@@ -17,8 +17,7 @@ vi.mock('@/lib/bot-api', async () => {
 });
 
 import { listLinks, getLinkMessages, deleteLink } from '@/lib/bot-api';
-import { useLinksStore } from '@/stores/linksStore';
-import { useMessagesStore } from '@/stores/messagesStore';
+import { withQueryClient } from '@/test/queryWrapper';
 import LinkDetail from './LinkDetail';
 
 const link: Link = {
@@ -47,29 +46,20 @@ const messages: Message[] = [
   },
 ];
 
-function reset(): void {
-  useLinksStore.setState({
-    links: [link],
-    currentLink: link,
-    loading: false,
-    error: null,
-  });
-  useMessagesStore.setState({ messages, loading: false, error: null });
-}
-
 function renderDetail() {
   return render(
-    <MemoryRouter initialEntries={['/links/link-1']}>
-      <Routes>
-        <Route path="/links/:id" element={<LinkDetail />} />
-        <Route path="/" element={<div>back at home</div>} />
-      </Routes>
-    </MemoryRouter>,
+    withQueryClient(
+      <MemoryRouter initialEntries={['/links/link-1']}>
+        <Routes>
+          <Route path="/links/:id" element={<LinkDetail />} />
+          <Route path="/" element={<div>back at home</div>} />
+        </Routes>
+      </MemoryRouter>,
+    ),
   );
 }
 
 beforeEach(() => {
-  reset();
   vi.mocked(listLinks).mockResolvedValue([link]);
   vi.mocked(getLinkMessages).mockResolvedValue(messages);
   vi.mocked(deleteLink).mockReset();
@@ -81,7 +71,7 @@ beforeEach(() => {
 describe('<LinkDetail />', () => {
   it('renders the activity tab by default and lists messages', async () => {
     renderDetail();
-    expect(screen.getByText('hello bot')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('hello bot')).toBeInTheDocument());
     expect(screen.getByText('hi human')).toBeInTheDocument();
   });
 

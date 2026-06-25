@@ -5,12 +5,13 @@
 //     LinkCard per active link, with empty / loading / error states.
 //   - "Link new chat" (1-of-3 on lg+) — prominent CTA → /link/new.
 
-import { useEffect, type ReactElement } from 'react';
+import { type ReactElement } from 'react';
 import { Link as RouterLink } from 'react-router-dom';
 
 import BentoCard from '@/components/layout/BentoCard';
 import LinkCard from '@/components/links/LinkCard';
-import { useLinksStore } from '@/stores/linksStore';
+import { useLinks } from '@/api/hooks';
+import { getErrorMessage } from '@/lib/errors';
 
 function SkeletonRow(): ReactElement {
   return (
@@ -56,14 +57,8 @@ function EmptyState(): ReactElement {
 }
 
 export default function Dashboard(): ReactElement {
-  const links = useLinksStore((s) => s.links);
-  const loading = useLinksStore((s) => s.loading);
-  const error = useLinksStore((s) => s.error);
-  const fetchLinks = useLinksStore((s) => s.fetchLinks);
-
-  useEffect(() => {
-    void fetchLinks();
-  }, [fetchLinks]);
+  const { data, isPending, isError, error, refetch } = useLinks();
+  const links = data ?? [];
 
   return (
     <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -72,23 +67,23 @@ export default function Dashboard(): ReactElement {
         subtitle="Chats wired to your Moses agents"
         className="lg:col-span-2"
       >
-        {loading && links.length === 0 ? (
+        {isPending ? (
           <div className="space-y-3" aria-busy="true" aria-live="polite">
             <SkeletonRow />
             <SkeletonRow />
             <SkeletonRow />
           </div>
-        ) : error ? (
+        ) : isError ? (
           <div
             role="alert"
             className="flex flex-col gap-3 rounded-bento border border-moses-status-error/40 bg-moses-status-error/10 p-4 sm:flex-row sm:items-center sm:justify-between"
           >
             <p className="text-sm text-moses-status-error">
-              Could not load links: {error.message}
+              Could not load links: {getErrorMessage(error)}
             </p>
             <button
               type="button"
-              onClick={() => void fetchLinks()}
+              onClick={() => void refetch()}
               className="min-h-[44px] rounded-bento border border-moses-status-error/50 bg-moses-surface-raised px-4 text-sm font-medium text-moses-status-error hover:bg-moses-status-error/10 focus:outline-none focus:ring-2 focus:ring-moses-status-error/40 dark:bg-moses-surface-dark-raised"
             >
               Retry

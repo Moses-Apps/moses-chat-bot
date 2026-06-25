@@ -10,7 +10,7 @@ import { useId, type ReactElement } from 'react';
 import type { Link } from '@/lib/bot-api';
 import SearchInput from '@/components/SearchInput';
 import ProviderIcon from '@/components/links/ProviderIcon';
-import type { MessagesFilters } from '@/stores/messagesStore';
+import type { MessagesFilters } from '@/api/messageFilters';
 
 interface MessageFiltersProps {
   links: Link[];

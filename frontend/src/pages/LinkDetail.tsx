@@ -3,7 +3,7 @@
 // On mount we fetch links (if the store is empty) so that `selectLink`
 // resolves the row even on a deep refresh, then load the last 100 messages.
 
-import { useEffect, useState, type ReactElement } from 'react';
+import { useState, type ReactElement } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 
 import BentoCard from '@/components/layout/BentoCard';
@@ -12,8 +12,8 @@ import ConfirmDialog from '@/components/ConfirmDialog';
 import Tabs from '@/components/Tabs';
 import MessageList from '@/components/links/MessageList';
 import ProviderIcon from '@/components/links/ProviderIcon';
-import { useLinksStore } from '@/stores/linksStore';
-import { useMessagesStore } from '@/stores/messagesStore';
+import { useLink, useLinkMessages, useUnlink } from '@/api/hooks';
+import { getErrorMessage } from '@/lib/errors';
 
 const absoluteFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: 'medium',
@@ -34,47 +34,36 @@ function providerLabel(provider: string): string {
 export default function LinkDetail(): ReactElement {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const links = useLinksStore((s) => s.links);
-  const currentLink = useLinksStore((s) => s.currentLink);
-  const fetchLinks = useLinksStore((s) => s.fetchLinks);
-  const selectLink = useLinksStore((s) => s.selectLink);
-  const unlink = useLinksStore((s) => s.unlink);
 
-  const messages = useMessagesStore((s) => s.messages);
-  const messagesLoading = useMessagesStore((s) => s.loading);
-  const messagesError = useMessagesStore((s) => s.error);
-  const fetchMessages = useMessagesStore((s) => s.fetchMessages);
+  // The links list query resolves the row (no /links/:id route exists). On a
+  // deep refresh with a cold cache the query fetches the list automatically —
+  // no manual fetch-if-empty effect needed.
+  const { link: currentLink } = useLink(id);
+
+  const {
+    data: messages = [],
+    isPending: messagesLoading,
+    isError: messagesIsError,
+    error: messagesError,
+  } = useLinkMessages(id, 100);
+
+  const unlink = useUnlink();
 
   const [tab, setTab] = useState<string>('activity');
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [unlinkBusy, setUnlinkBusy] = useState(false);
   const [unlinkError, setUnlinkError] = useState<string | null>(null);
+  const unlinkBusy = unlink.isPending;
 
-  // Load links list if empty (deep-refresh path), then resolve currentLink.
-  useEffect(() => {
-    if (links.length === 0) void fetchLinks();
-  }, [links.length, fetchLinks]);
-
-  useEffect(() => {
+  function onConfirmUnlink(): void {
     if (!id) return;
-    selectLink(id);
-    void fetchMessages(id, 100);
-  }, [id, links.length, selectLink, fetchMessages]);
-
-  async function onConfirmUnlink(): Promise<void> {
-    if (!id) return;
-    setUnlinkBusy(true);
     setUnlinkError(null);
-    try {
-      await unlink(id);
-      setConfirmOpen(false);
-      navigate('/');
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Could not unlink.';
-      setUnlinkError(msg);
-    } finally {
-      setUnlinkBusy(false);
-    }
+    unlink.mutate(id, {
+      onSuccess: () => {
+        setConfirmOpen(false);
+        navigate('/');
+      },
+      onError: (err) => setUnlinkError(getErrorMessage(err) || 'Could not unlink.'),
+    });
   }
 
   if (!id) {
@@ -127,9 +116,9 @@ export default function LinkDetail(): ReactElement {
                 <p className="text-sm text-moses-text-muted" aria-busy="true">
                   Loading messages…
                 </p>
-              ) : messagesError ? (
+              ) : messagesIsError ? (
                 <p role="alert" className="text-sm text-moses-status-error">
-                  Could not load messages: {messagesError.message}
+                  Could not load messages: {getErrorMessage(messagesError)}
                 </p>
               ) : (
                 <MessageList messages={messages} />
@@ -183,7 +172,7 @@ export default function LinkDetail(): ReactElement {
         confirmLabel="Unlink"
         destructive
         busy={unlinkBusy}
-        onConfirm={() => void onConfirmUnlink()}
+        onConfirm={onConfirmUnlink}
         onCancel={() => {
           if (!unlinkBusy) {
             setConfirmOpen(false);

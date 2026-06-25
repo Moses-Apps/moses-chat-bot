@@ -1,7 +1,7 @@
 // Messages page — filter wiring, infinite scroll, axe clean.
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { axe } from 'jest-axe';
 import type { Link, Message, SearchMessagesResponse } from '@/lib/bot-api';
@@ -16,8 +16,7 @@ vi.mock('@/lib/bot-api', async () => {
 });
 
 import { listLinks, searchMessages } from '@/lib/bot-api';
-import { useLinksStore } from '@/stores/linksStore';
-import { useMessagesStore, EMPTY_FILTERS } from '@/stores/messagesStore';
+import { withQueryClient } from '@/test/queryWrapper';
 import Messages from './Messages';
 
 const link: Link = {
@@ -60,34 +59,18 @@ const m3: Message = {
   occurredAt: '2026-05-19T10:01:00Z',
 };
 
-function resetStores(): void {
-  useLinksStore.setState({
-    links: [link, link2],
-    currentLink: null,
-    loading: false,
-    error: null,
-  });
-  useMessagesStore.setState({
-    pageMessages: [],
-    filters: { ...EMPTY_FILTERS },
-    cursor: null,
-    hasMore: false,
-    searching: false,
-    searchError: null,
-  });
-}
-
 function renderPage() {
   return render(
-    <MemoryRouter>
-      <Messages />
-    </MemoryRouter>,
+    withQueryClient(
+      <MemoryRouter>
+        <Messages />
+      </MemoryRouter>,
+    ),
   );
 }
 
 describe('<Messages />', () => {
   beforeEach(() => {
-    resetStores();
     vi.mocked(listLinks).mockResolvedValue([link, link2]);
     vi.mocked(searchMessages).mockReset();
   });
@@ -119,41 +102,23 @@ describe('<Messages />', () => {
   });
 
   it('client-filters by free-text after the debounce settles', async () => {
-    vi.useFakeTimers();
-    try {
-      vi.mocked(searchMessages).mockResolvedValue({
-        messages: [m1, m2, m3],
-      } as SearchMessagesResponse);
-      renderPage();
-      // First fetch runs immediately under fake timers — flush pending promises.
-      await act(async () => {
-        await Promise.resolve();
-      });
-      await act(async () => {
-        await Promise.resolve();
-      });
-      const search = screen.getByRole('searchbox', { name: /search message text/i });
-      fireEvent.change(search, { target: { value: 'goodbye' } });
-      // Debounce is 250ms. Before the window settles, nothing changes.
-      act(() => {
-        vi.advanceTimersByTime(249);
-      });
-      // After settle, the effect refetches + reapplies client filter.
-      act(() => {
-        vi.advanceTimersByTime(2);
-      });
-      // Flush microtasks for the await inside searchAll.
-      await act(async () => {
-        await Promise.resolve();
-      });
-      await act(async () => {
-        await Promise.resolve();
-      });
+    // Real timers + waitFor: the search-input debounce (250ms) plus TanStack
+    // Query's async refetch resolve naturally, and the client filter narrows
+    // the buffer to the matching row. (The earlier fake-timer microtask juggle
+    // was brittle once the buffer became a TanStack useInfiniteQuery.)
+    vi.mocked(searchMessages).mockResolvedValue({
+      messages: [m1, m2, m3],
+    } as SearchMessagesResponse);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('hello world')).toBeInTheDocument());
+
+    const search = screen.getByRole('searchbox', { name: /search message text/i });
+    fireEvent.change(search, { target: { value: 'goodbye' } });
+
+    await waitFor(() => {
       expect(screen.queryByText('hello world')).toBeNull();
       expect(screen.getByText('goodbye world')).toBeInTheDocument();
-    } finally {
-      vi.useRealTimers();
-    }
+    });
   });
 
   it('Load more button drives the next page', async () => {

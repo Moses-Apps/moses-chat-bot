@@ -25,13 +25,16 @@ import {
   connectTelegram,
   disconnectTelegram,
 } from '@/lib/bot-api';
+import { withQueryClient } from '@/test/queryWrapper';
 import ConnectTelegram from './ConnectTelegram';
 
 function renderWizard() {
   return render(
-    <MemoryRouter>
-      <ConnectTelegram />
-    </MemoryRouter>,
+    withQueryClient(
+      <MemoryRouter>
+        <ConnectTelegram />
+      </MemoryRouter>,
+    ),
   );
 }
 

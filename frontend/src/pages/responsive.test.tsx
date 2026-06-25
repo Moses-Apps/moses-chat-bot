@@ -23,6 +23,7 @@ vi.mock('@/lib/bot-api', async () => {
   };
 });
 
+import { withQueryClient } from '@/test/queryWrapper';
 import Dashboard from './Dashboard';
 import LinkNew from './LinkNew';
 
@@ -38,9 +39,11 @@ beforeEach(() => {
 describe('responsive layout classes', () => {
   it('Dashboard grid uses single-column at <lg and 3-col at lg+', () => {
     const { container } = render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
+      withQueryClient(
+        <MemoryRouter>
+          <Dashboard />
+        </MemoryRouter>,
+      ),
     );
     const grid = container.querySelector('.grid-cols-1.lg\\:grid-cols-3');
     expect(grid).not.toBeNull();
@@ -68,9 +71,11 @@ describe('responsive layout classes', () => {
 describe('responsive: touch targets ≥44px', () => {
   it('Dashboard CTA + provider radios use min-h-[44px] or min-h-[64px]', () => {
     const { container } = render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
+      withQueryClient(
+        <MemoryRouter>
+          <Dashboard />
+        </MemoryRouter>,
+      ),
     );
     // The "Link new chat" CTA + the empty-state CTA both wear min-h-[44px].
     const ctas = container.querySelectorAll('a[href="/link/new"]');
